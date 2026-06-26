@@ -35,31 +35,41 @@ hashes in flash** instead:
 
 ## Build & flash (PlatformIO)
 
-```bash
-# 1. generate the blocklist hash table (downloads StevenBlack hosts by default)
-python3 tools/build_blocklist.py --download data/blocklist.bin
-#    or a bigger list:
-#    curl -sL https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews-gambling-porn-social/hosts -o hosts
-#    python3 tools/build_blocklist.py hosts data/blocklist.bin
+One USB flash to get going — after that, **firmware and blocklist both update over WiFi** (see below).
 
-# 2. set your WiFi creds (secrets.h is gitignored, so they stay local)
+```bash
+# 1. set your WiFi creds (secrets.h is gitignored, so they stay local)
 cp src/secrets.example.h src/secrets.h
 #    then edit src/secrets.h -> WIFI_SSID / WIFI_PASS
 
-# 3. flash firmware + the blocklist filesystem
+# 2. build the blocklist hash table (default = StevenBlack base + Hagezi Light,
+#    ~140k domains, WhatsApp/social safe)
+python3 tools/build_blocklist.py data/blocklist.bin
+
+# 3. flash firmware + the blocklist filesystem (the one and only USB flash)
 pio run -t upload
 pio run -t uploadfs
 
-# 4. watch it boot
-pio device monitor
+# 4. watch it boot, note the IP / open the dashboard
+pio device monitor          # -> http://c3adblock.local
 ```
 
-You should see:
-```
-blocklist: 133267 domains (1066136 bytes)
-WiFi up: 192.168.1.x
-DNS sinkhole listening on :53
-```
+## Over-the-air updates (no more USB)
+
+The dashboard at **http://c3adblock.local** does it all:
+
+- **Blocklist** — drop a freshly built `blocklist.bin` into *Blocklist → Upload*, or set a
+  URL under *Remote auto-update* and the device pulls a prebuilt `blocklist.bin`
+  on a schedule (e.g. a GitHub release asset — update it once, every device fetches it).
+- **Firmware** — upload `.pio/build/c3/firmware.bin` under *Firmware → OTA update*; the
+  device verifies it and reboots into the new image. Or push over WiFi from the CLI:
+  ```bash
+  pio run -t upload --upload-port c3adblock.local --upload-protocol espota
+  ```
+
+**4 MB flash tradeoff:** firmware OTA needs *two* app slots, which leaves ~1.3 MB for the
+blocklist (**~250k domains max**). The aggressive 537k "ultimate" list only fits the
+single-app partition table (no firmware OTA). Pick your tradeoff in `partitions.csv`.
 
 ## Use it
 
@@ -85,12 +95,13 @@ dig @<c3-ip> github.com        # -> real IP  (forwarded)
 - DNS clients add an **EDNS OPT** record; a blocked reply must contain only the
   question + answer (ANCOUNT=1, NSCOUNT=ARCOUNT=0) or it's malformed.
 
-## How it could grow
+## Done / how it could grow
 
-- Bloom filter in RAM as a fast pre-filter (skip flash for the ~99% of misses)
-- Repartition for ~300k domains
-- Tiny web UI with block/allow counters
-- mDNS hostname for easy discovery
+- ✅ Web dashboard — per-client block/allow counts, ban a client, add custom domains
+- ✅ mDNS (`c3adblock.local`) for discovery
+- ✅ OTA — firmware + blocklist update over WiFi, plus scheduled remote blocklist pulls
+- ⬜ Bloom filter in RAM as a fast pre-filter (skip flash for the ~99% of misses)
+- ⬜ Act as the DHCP server (hand itself out as DNS) for true plug-and-play
 
 ## Credits
 
