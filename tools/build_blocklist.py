@@ -7,8 +7,14 @@ HASH_BYTES MUST match the firmware (src/main.cpp). 5 bytes (40-bit) keeps
 ~0 collisions up to ~500k domains while fitting half a million in <3 MB.
 
 Usage: build_blocklist.py [out.bin] [src ...]
-  src = local file or URL. With none given, downloads the default big set
-  (StevenBlack everything + Hagezi Ultimate) ~= 500k+ domains.
+  src = local file or URL. With none given, downloads a balanced daily-driver set
+  (StevenBlack base + Hagezi Pro) ~= 200k domains: blocks ads/trackers/malware
+  but leaves WhatsApp/Instagram/social/messaging working.
+
+  For the aggressive "test the limits" build (~500k, also blocks social/messaging):
+    build_blocklist.py blocklist.bin \\
+      https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews-gambling-porn-social/hosts \\
+      https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/ultimate.txt
 """
 import sys, os, math, urllib.request
 
@@ -18,9 +24,13 @@ FNV_OFFSET = 0xcbf29ce484222325
 FNV_PRIME  = 0x100000001b3
 U64 = (1 << 64) - 1
 
+# Daily driver that FITS alongside dual-OTA firmware slots (~250k domain budget):
+# ads + trackers + malware, WhatsApp/social keep working. ~140k domains / 0.67 MB.
+# Want more (up to ~250k)? swap light.txt -> pro.txt is 370k and ONLY fits the
+# single-app (no-OTA) partition table.
 DEFAULT_SOURCES = [
-    'https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews-gambling-porn-social/hosts',
-    'https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/ultimate.txt',
+    'https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts',            # base: ads + malware
+    'https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/light.txt',  # Hagezi Light
 ]
 
 def fnv(b: bytes) -> int:
