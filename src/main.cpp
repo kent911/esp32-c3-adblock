@@ -9,6 +9,10 @@
 #include <LittleFS.h>
 #include <ESPmDNS.h>
 #include <WebServer.h>
+#include <Update.h>            // firmware OTA
+#include <HTTPClient.h>        // remote blocklist fetch
+#include <WiFiClientSecure.h>  // https fetch
+#include <ArduinoOTA.h>        // network firmware flashing (pio run over wifi)
 #include "lwip/etharp.h"
 #include "lwip/netif.h"
 #include "secrets.h"   // defines WIFI_SSID / WIFI_PASS — copy secrets.example.h and fill in
@@ -36,6 +40,12 @@ String customDom[MAX_CUSTOM]; uint64_t customHash[MAX_CUSTOM]; int numCustom = 0
 
 static const int MAX_BAN = 32;
 uint32_t bannedIP[MAX_BAN]; int numBanned = 0;
+
+// remote blocklist auto-update
+String updateUrl = "";              // URL of a prebuilt blocklist.bin (e.g. GitHub release asset)
+uint32_t updateIntervalH = 24;      // hours between auto-fetches
+uint32_t lastCheckMs = 0;
+String updateStatus = "never";
 
 // ---------- hashing / matching ----------
 static uint64_t fnv40(const char* s, size_t n) {
@@ -182,6 +192,16 @@ h2{font-size:14px;color:#8b949e;margin:18px 0 8px}
 <h2>CUSTOM BLOCKED DOMAINS</h2>
 <div style=margin-bottom:8px><input id=dom placeholder="ads.example.com" size=30><button onclick=addDom()>Block domain</button></div>
 <table id=cl><tbody></tbody></table>
+<h2>BLOCKLIST &mdash; UPLOAD</h2>
+<form id=upf style=margin-bottom:6px><input type=file id=blf accept=.bin><button>Upload blocklist</button> <span id=upmsg style=color:#8b949e></span></form>
+<div style="color:#8b949e;font-size:12px;margin-bottom:18px">build <code>blocklist.bin</code> with <code>tools/build_blocklist.py</code>, then upload here &mdash; no USB</div>
+<h2>BLOCKLIST &mdash; REMOTE AUTO-UPDATE</h2>
+<div style=margin-bottom:6px><input id=uurl placeholder="https://host/blocklist.bin" size=40> every <input id=uiv size=2 value=24>h
+<button onclick=saveUpd()>Save</button> <button onclick=fetchNow()>Fetch now</button></div>
+<div style="color:#8b949e;font-size:12px;margin-bottom:18px">device pulls a prebuilt <code>blocklist.bin</code> on a schedule (e.g. a GitHub release asset). last: <span id=ustat>&mdash;</span></div>
+<h2>FIRMWARE &mdash; OTA UPDATE</h2>
+<form id=fwf style=margin-bottom:6px><input type=file id=fwb accept=.bin><button>Flash firmware</button> <span id=fwmsg style=color:#8b949e></span></form>
+<div style="color:#8b949e;font-size:12px;margin-bottom:18px">upload <code>.pio/build/c3/firmware.bin</code> &mdash; device verifies it and reboots into it</div>
 </div><script>
 function fmt(n){return n.toLocaleString()}
 async function load(){let s=await(await fetch('/stats.json')).json();
@@ -193,8 +213,23 @@ ct.tBodies[0].innerHTML=s.clients.sort((a,b)=>(b.blocked+b.allowed)-(a.blocked+a
 `<tr><td>${c.ip}${c.banned?' <span class=tag style=color:#f85149>BANNED</span>':''}</td><td>${c.mac}</td>
 <td class=b>${fmt(c.blocked)}</td><td class=a>${fmt(c.allowed)}</td>
 <td><button class=ban onclick="fetch('/ban?ip=${c.ip}').then(load)">${c.banned?'Unban':'Ban'}</button></td></tr>`).join('');
-cl.tBodies[0].innerHTML=s.custom.map(d=>`<tr><td>${d}</td><td style=text-align:right><button onclick="fetch('/unblock?d='+encodeURIComponent('${d}')).then(load)">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet</td></tr>';}
+cl.tBodies[0].innerHTML=s.custom.map(d=>`<tr><td>${d}</td><td style=text-align:right><button onclick="fetch('/unblock?d='+encodeURIComponent('${d}')).then(load)">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet</td></tr>';
+if(document.activeElement!=uurl)uurl.value=s.upurl||'';
+if(document.activeElement!=uiv)uiv.value=s.upiv||24;
+ustat.textContent=s.upstat||'—';}
 function addDom(){let d=dom.value.trim();if(d){fetch('/addblock?d='+encodeURIComponent(d)).then(()=>{dom.value='';load()})}}
+function saveUpd(){fetch('/setupdate?u='+encodeURIComponent(uurl.value.trim())+'&h='+(parseInt(uiv.value)||24)).then(load)}
+function fetchNow(){ustat.textContent='fetching...';fetch('/fetchnow').then(r=>r.text()).then(t=>{ustat.textContent=t;load()})}
+fwf.onsubmit=async e=>{e.preventDefault();let f=fwb.files[0];if(!f)return;fwmsg.textContent='flashing '+(f.size/1048576).toFixed(2)+' MB...';
+let fd=new FormData();fd.append('f',f);
+try{let r=await fetch('/update',{method:'POST',body:fd});fwmsg.textContent=r.ok?'✓ rebooting, reconnect in ~15s':'✗ '+await r.text();}
+catch(_){fwmsg.textContent='✓ rebooting, reconnect in ~15s';}};
+upf.onsubmit=async e=>{e.preventDefault();let f=blf.files[0];if(!f)return;
+upmsg.textContent='uploading '+(f.size/1048576).toFixed(2)+' MB...';
+let fd=new FormData();fd.append('f',f);
+try{let r=await fetch('/upload',{method:'POST',body:fd});upmsg.textContent=r.ok?'✓ updated':'✗ '+await r.text();}
+catch(_){upmsg.textContent='✗ upload failed';}
+blf.value='';setTimeout(load,600);};
 load();setInterval(load,3000);
 </script></body></html>)HTML";
 
@@ -203,7 +238,9 @@ static void handleStats() {
   char ut[24]; snprintf(ut, sizeof(ut), "%lud %luh %lum", up/86400, (up%86400)/3600, (up%3600)/60);
   String j = "{\"ip\":\"" + WiFi.localIP().toString() + "\",\"blocked\":" + totalBlocked + ",\"allowed\":" + totalAllowed +
              ",\"domains\":" + numHashes + ",\"rssi\":" + WiFi.RSSI() + ",\"temp\":" + String(temperatureRead(), 1) +
-             ",\"heap\":" + ESP.getFreeHeap() + ",\"uptime\":\"" + ut + "\",\"clients\":[";
+             ",\"heap\":" + ESP.getFreeHeap() + ",\"uptime\":\"" + ut + "\"" +
+             ",\"upurl\":\"" + jesc(updateUrl) + "\",\"upiv\":" + updateIntervalH + ",\"upstat\":\"" + jesc(updateStatus) + "\"" +
+             ",\"clients\":[";
   for (int i = 0; i < numClients; i++) { Dev& c = clients[i]; IPAddress ip(c.ip);
     j += (i ? "," : ""); j += "{\"ip\":\"" + ip.toString() + "\",\"mac\":\"" + macStr(c.mac) + "\",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed + ",\"banned\":" + (c.banned?"true":"false") + "}"; }
   j += "],\"custom\":[";
@@ -216,13 +253,127 @@ static void handleBan() {
   web.send(200, "text/plain", "ok");
 }
 
+// ---------- blocklist swap (shared by upload + remote fetch) ----------
+// The partition holds one list, so we free the old one before writing the new.
+// While swapping, numHashes=0 -> device fail-opens (forwards, no blocking).
+static void reopenBlocklist() {
+  blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
+  numHashes = blocklist ? blocklist.size() / HASH_BYTES : 0;
+}
+static void beginBlocklistSwap() {
+  if (blocklist) blocklist.close();
+  numHashes = 0;
+  LittleFS.remove(BLOCKLIST_PATH);
+  LittleFS.remove("/blocklist.new");
+}
+static bool commitNewBlocklist() {                  // /blocklist.new -> live (validated)
+  File f = LittleFS.open("/blocklist.new", "r");
+  size_t sz = f ? f.size() : 0; if (f) f.close();
+  bool ok = sz > 0 && (sz % HASH_BYTES) == 0;       // sorted hash blob -> 5-byte multiple
+  if (ok) LittleFS.rename("/blocklist.new", BLOCKLIST_PATH);
+  else    LittleFS.remove("/blocklist.new");
+  reopenBlocklist();
+  return ok;
+}
+
+// ---------- OTA blocklist update (browser upload) ----------
+static bool upOk = false;
+static File upFile;
+static void handleUploadDone() {
+  web.send(upOk ? 200 : 500, "text/plain",
+           upOk ? "ok" : "rejected: empty or size not a multiple of 5 (not a blocklist.bin?)");
+}
+static void handleUpload() {
+  HTTPUpload& u = web.upload();
+  switch (u.status) {
+    case UPLOAD_FILE_START:
+      upOk = false; beginBlocklistSwap();
+      upFile = LittleFS.open("/blocklist.new", "w");
+      Serial.printf("[ota] receiving %s\n", u.filename.c_str());
+      break;
+    case UPLOAD_FILE_WRITE:
+      if (upFile) upFile.write(u.buf, u.currentSize);
+      break;
+    case UPLOAD_FILE_END:
+      if (upFile) upFile.close();
+      upOk = commitNewBlocklist();
+      Serial.printf("[ota] %s -> %u domains\n", upOk ? "OK" : "REJECTED", numHashes);
+      break;
+    case UPLOAD_FILE_ABORTED:
+      if (upFile) upFile.close();
+      LittleFS.remove("/blocklist.new"); reopenBlocklist();
+      Serial.println("[ota] aborted");
+      break;
+  }
+}
+
+// ---------- remote blocklist auto-update ----------
+static void loadUpdateCfg() {
+  File f = LittleFS.open("/update.cfg", "r"); if (!f) return;
+  updateUrl = f.readStringUntil('\n'); updateUrl.trim();
+  String iv = f.readStringUntil('\n'); iv.trim(); if (iv.length()) updateIntervalH = iv.toInt();
+  f.close(); if (updateIntervalH < 1) updateIntervalH = 1;
+}
+static void saveUpdateCfg() {
+  File f = LittleFS.open("/update.cfg", "w"); if (!f) return;
+  f.println(updateUrl); f.println(updateIntervalH); f.close();
+}
+static bool fetchBlocklist(String url) {
+  url.trim(); if (!url.length()) { updateStatus = "no url set"; return false; }
+  Serial.printf("[remote] GET %s\n", url.c_str());
+  WiFiClientSecure cs; cs.setInsecure();            // blocklist isn't secret -> skip cert pinning
+  WiFiClient cl;
+  HTTPClient http; http.setTimeout(20000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);  // GitHub release -> CDN redirect
+  bool https = url.startsWith("https");
+  if (!(https ? http.begin(cs, url) : http.begin(cl, url))) { updateStatus = "begin failed"; return false; }
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) { http.end(); updateStatus = "HTTP " + String(code); Serial.printf("[remote] %s\n", updateStatus.c_str()); return false; }
+  beginBlocklistSwap();
+  File f = LittleFS.open("/blocklist.new", "w");
+  if (!f) { http.end(); updateStatus = "fs open failed"; reopenBlocklist(); return false; }
+  WiFiClient* stream = http.getStreamPtr();
+  int len = http.getSize(); uint8_t b[1024]; size_t total = 0; uint32_t idle = millis();
+  while (http.connected() && (len < 0 || (int)total < len)) {
+    size_t avail = stream->available();
+    if (avail) { int n = stream->readBytes(b, avail > sizeof(b) ? sizeof(b) : avail); if (n > 0) { f.write(b, n); total += n; idle = millis(); } }
+    else { if (millis() - idle > 15000) break; delay(2); }
+  }
+  f.close(); http.end();
+  bool ok = commitNewBlocklist();
+  updateStatus = ok ? ("ok: " + String(numHashes) + " domains") : ("bad data (" + String(total) + "B)");
+  Serial.printf("[remote] %s\n", updateStatus.c_str());
+  return ok;
+}
+
+// ---------- firmware OTA (browser upload of firmware.bin -> reboot) ----------
+static void handleFwUpdateDone() {
+  bool ok = !Update.hasError();
+  web.send(ok ? 200 : 500, "text/plain", ok ? "ok, rebooting" : "firmware update failed");
+  if (ok) { delay(300); ESP.restart(); }
+}
+static void handleFwUpload() {
+  HTTPUpload& u = web.upload();
+  if (u.status == UPLOAD_FILE_START) {
+    Serial.printf("[fw-ota] %s\n", u.filename.c_str());
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
+  } else if (u.status == UPLOAD_FILE_WRITE) {
+    if (Update.write(u.buf, u.currentSize) != u.currentSize) Update.printError(Serial);
+  } else if (u.status == UPLOAD_FILE_END) {
+    if (Update.end(true)) Serial.printf("[fw-ota] %u bytes OK\n", u.totalSize);
+    else Update.printError(Serial);
+  } else if (u.status == UPLOAD_FILE_ABORTED) {
+    Update.abort(); Serial.println("[fw-ota] aborted");
+  }
+}
+
 void setup() {
   Serial.begin(115200); delay(300);
   Serial.println("\n[c3-adblock] booting");
   if (!LittleFS.begin(true)) Serial.println("LittleFS FAILED");
   blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
   if (blocklist) { numHashes = blocklist.size() / HASH_BYTES; Serial.printf("blocklist: %u domains\n", numHashes); }
-  loadCustom(); loadBanned();
+  loadCustom(); loadBanned(); loadUpdateCfg();
   Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
 
   WiFi.mode(WIFI_STA); WiFi.setSleep(false); WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -236,8 +387,28 @@ void setup() {
   web.on("/ban", handleBan);
   web.on("/addblock", []() { addCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
   web.on("/unblock", []() { removeCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
+  web.on("/upload", HTTP_POST, handleUploadDone, handleUpload);      // blocklist OTA
+  web.on("/update", HTTP_POST, handleFwUpdateDone, handleFwUpload);  // firmware OTA
+  web.on("/fetchnow", []() { fetchBlocklist(updateUrl); web.send(200, "text/plain", updateStatus); });
+  web.on("/setupdate", []() {
+    if (web.hasArg("u")) updateUrl = web.arg("u");
+    if (web.hasArg("h")) { updateIntervalH = web.arg("h").toInt(); if (updateIntervalH < 1) updateIntervalH = 1; }
+    saveUpdateCfg(); web.send(200, "text/plain", "ok");
+  });
   web.begin();
-  Serial.println("DNS :53 + dashboard :80 up");
+  ArduinoOTA.setHostname("c3adblock");   // pio run -t upload --upload-port c3adblock.local
+  ArduinoOTA.begin();
+  Serial.println("DNS :53 + dashboard :80 + OTA up");
 }
 
-void loop() { web.handleClient(); handleDns(); delay(1); }
+void loop() {
+  ArduinoOTA.handle();
+  web.handleClient();
+  handleDns();
+  if (updateUrl.length()) {               // periodic remote blocklist auto-update
+    uint32_t now = millis();
+    if (lastCheckMs == 0) lastCheckMs = now;   // skip an immediate fetch on boot
+    else if (now - lastCheckMs >= updateIntervalH * 3600000UL) { lastCheckMs = now; fetchBlocklist(updateUrl); }
+  }
+  delay(1);
+}
