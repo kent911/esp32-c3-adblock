@@ -32,6 +32,19 @@ hashes in flash** instead:
 - Any **ESP32-C3** board (tested on a C3 SuperMini), 4 MB flash, **no PSRAM needed**
 - Power it from a **stable USB source** (a phone charger or your router's USB port).
   Cheap/loose USB-C→A adapters can brown out the radio during WiFi transmit.
+- A **USB-A → USB-C dongle** lets it plug straight into the spare USB port on the
+  back of most routers — no power supply, no extra box.
+
+### Enclosure
+
+A printable case for the C3 SuperMini: [`hardware/esp32-c3-supermini-enclosure.stl`](hardware/esp32-c3-supermini-enclosure.stl)
+
+Printing notes:
+- No supports needed; 0.2 mm layers, ~15% infill is plenty.
+- **Keep the antenna end clear.** The C3's PCB antenna is the zig-zag trace on the
+  short edge opposite the USB-C port — don't bury it in solid plastic or put metal
+  near it, or your RSSI will suffer.
+- Leave the vents open: the board idles around 45–55 °C.
 
 ## Build & flash (PlatformIO)
 
