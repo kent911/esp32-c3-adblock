@@ -15,10 +15,9 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Generate Adblock Hashes
+      - name: Install dependencies
         run: |
           pip install requests
-          python generate_hashes.py
 
       - name: ESP-IDF Build
         uses: espressif/esp-idf-ci-action@v1
