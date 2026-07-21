@@ -10,18 +10,36 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Find Project Directory
+        id: find-dir
+        run: |
+          # Ищем папку, в которой лежит файл CMakeLists.txt
+          C_PATH=$(find . -name "CMakeLists.txt" -not -path "*/build/*" -print -quit | sed 's/\/CMakeLists.txt//g')
+          if [ -z "$C_PATH" ]; then
+            echo "Ошибка: Файл CMakeLists.txt не найден в репозитории!"
+            exit 1
+          fi
+          # Если файл нашли прямо в корне, убираем точку
+          if [ "$C_PATH" = "." ]; then
+            C_PATH=""
+          else
+            C_PATH=$(echo "$C_PATH" | sed 's/\.\///g')
+          fi
+          echo "PROJECT_PATH=$C_PATH" >> $GITHUB_ENV
+          echo "Найдена папка проекта: $C_PATH"
+
       - name: ESP-IDF Build
         uses: espressif/esp-idf-ci-action@v1
         with:
           esp_idf_version: v5.1
           target: esp32c3
-          path: 'esp32-c3-adblock-main'
+          path: '${{ env.PROJECT_PATH }}'
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: esp32c3-adblock-firmware
           path: |
-            esp32-c3-adblock-main/build/bootloader/bootloader.bin
-            esp32-c3-adblock-main/build/partition_table/partition-table.bin
-            esp32-c3-adblock-main/build/esp32-c3-adblock.bin
+            **/build/bootloader/bootloader.bin
+            **/build/partition_table/partition-table.bin
+            **/build/esp32-c3-adblock.bin
