@@ -15,13 +15,13 @@ jobs:
         with:
           esp_idf_version: v5.1
           target: esp32c3
-          path: '.'
+          path: 'esp32-c3-adblock-main'
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: esp32c3-adblock-firmware
           path: |
-            build/bootloader/bootloader.bin
-            build/partition_table/partition-table.bin
-            build/esp32-c3-adblock.bin
+            esp32-c3-adblock-main/build/bootloader/bootloader.bin
+            esp32-c3-adblock-main/build/partition_table/partition-table.bin
+            esp32-c3-adblock-main/build/esp32-c3-adblock.bin
