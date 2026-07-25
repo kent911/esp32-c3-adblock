@@ -2,8 +2,9 @@ name: Auto Update Blocklist
 
 on:
   schedule:
-    - cron: '0 2 * * *' # Автозапуск каждую ночь в 02:00 по Гринвичу
+    - cron: '0 2 * * 0' # Автозапуск каждое ВОСКРЕСЕНЬЕ в 02:00 ночи по Гринвичу
   workflow_dispatch:     # Кнопка для ручного запуска в любое время
+
 
 jobs:
   update-list:
