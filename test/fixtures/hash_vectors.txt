@@ -1,0 +1,11 @@
+# Shared FNV-1a/40-bit vectors: the firmware (src/dns_core.h) and the blocklist
+# builder (tools/build_blocklist.py) MUST agree on every one of these, otherwise
+# a generated blocklist.bin silently blocks nothing.
+# format: <domain> <hash as 10 hex digits, big-endian text of the 40-bit value>
+a 4c8601ec8c
+example.com 634e2714c6
+ads.example.com 58979aa55e
+doubleclick.net cd127775cd
+googleadservices.com 6001a28d70
+sub.deep.tracker.io 8464fa2649
+xn--80ak6aa92e.com d47e8b7f2c
