@@ -5,6 +5,9 @@ on:
     - cron: '0 2 * * 0' # Автозапуск каждое ВОСКРЕСЕНЬЕ в 02:00 ночи по Гринвичу
   workflow_dispatch:     # Кнопка для ручного запуска в любое время
 
+permissions:
+  contents: write
+
 
 jobs:
   update-list:
@@ -16,7 +19,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-python-version: '3.10'
+          python-version: '3.10'
 
       - name: Generate Fresh Blocklist
         run: |
