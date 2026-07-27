@@ -90,6 +90,15 @@ inline int buildBlockedResponse(uint8_t* buf, int qend, uint16_t qtype) {
   return qend + (int)sizeof(ans);
 }
 
+// Turns the query already sitting in `buf` into a SERVFAIL reply. Used when the
+// upstream resolver does not answer: dropping the packet instead would leave the
+// client waiting for its own timeout with no hint of what went wrong.
+inline int buildServfailResponse(uint8_t* buf, int qend) {
+  buf[2] = 0x81; buf[3] = 0x82;
+  buf[6] = 0; buf[7] = 0; buf[8] = 0; buf[9] = 0; buf[10] = 0; buf[11] = 0;
+  return qend;
+}
+
 // Accepts only what a stored/serialised domain may contain: lowercase letters,
 // digits, '-' and '.', with no leading/trailing/doubled dot. Keeps markup and
 // control characters out of custom.txt and of the dashboard JSON.

@@ -12,26 +12,35 @@
 // newline-delimited text blob. Lines are trimmed and handed to onLine, which
 // returns false to stop reading. Empty lines are passed through so positional
 // files (update.cfg) keep their line numbering.
+// Returns false if the file could not be opened (missing file included, which is
+// normal on first boot -- callers that care log it themselves).
 template <typename Fn>
-static void fsReadLines(const char* path, Fn onLine) {
+static bool fsReadLines(const char* path, Fn onLine) {
   File f = LittleFS.open(path, "r");
-  if (!f) return;
+  if (!f) return false;
   while (f.available()) {
     String line = f.readStringUntil('\n');
     line.trim();
     if (!onLine(line)) break;
   }
   f.close();
+  return true;
 }
 
-// Rewrites path with count lines produced by lineAt(i).
+// Rewrites path with count lines produced by lineAt(i). False means the file is
+// now short or missing: a full/worn flash makes println() write less than asked.
 template <typename Fn>
 static bool fsWriteLines(const char* path, int count, Fn lineAt) {
   File f = LittleFS.open(path, "w");
-  if (!f) return false;
-  for (int i = 0; i < count; i++) f.println(lineAt(i));
+  if (!f) { Serial.printf("[fs] %s: open for write failed\n", path); return false; }
+  bool ok = true;
+  for (int i = 0; i < count; i++) {
+    String line = lineAt(i);
+    ok = (f.println(line) == line.length() + 2) && ok;
+  }
   f.close();
-  return true;
+  if (!ok) Serial.printf("[fs] %s: write failed (flash full?)\n", path);
+  return ok;
 }
 
 // ---------- domains ----------
@@ -73,7 +82,6 @@ static String jsonEscape(const String& s) { String o; dnscore::appendJsonEscaped
 static String jsonString(const String& s) { return "\"" + jsonEscape(s) + "\""; }
 
 // ---------- web replies ----------
-static void sendPlain(WebServer& w, const String& msg) { w.send(200, "text/plain", msg); }
 static void sendResult(WebServer& w, bool ok, const String& okMsg, const String& errMsg) {
   w.send(ok ? 200 : 500, "text/plain", ok ? okMsg : errMsg);
 }

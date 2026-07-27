@@ -298,6 +298,25 @@ static void test_build_blocked_response() {
   CHECK_EQ_INT(buf[qend], 0);                               // nothing written past the question
 }
 
+static void test_build_servfail_response() {
+  uint8_t buf[600];
+
+  TEST_CASE("an unanswered query comes back as SERVFAIL with no records");
+  std::vector<uint8_t> pkt = query({"example", "com"});
+  memset(buf, 0, sizeof(buf));
+  memcpy(buf, pkt.data(), pkt.size());
+  int qend = (int)pkt.size();
+  CHECK_EQ_INT(dnscore::buildServfailResponse(buf, qend), qend);
+  CHECK_EQ_INT(buf[2], 0x81); CHECK_EQ_INT(buf[3], 0x82);   // QR + RD/RA, rcode SERVFAIL
+  CHECK_EQ_INT(buf[7], 0);                                  // ANCOUNT
+  CHECK_EQ_INT(buf[9], 0); CHECK_EQ_INT(buf[11], 0);        // NSCOUNT / ARCOUNT
+
+  TEST_CASE("the query id and question section are left untouched");
+  CHECK_EQ_INT(buf[0], 0xAB); CHECK_EQ_INT(buf[1], 0xCD);
+  CHECK_EQ_INT(buf[5], 1);                                  // QDCOUNT
+  CHECK_EQ_INT(memcmp(buf + 12, pkt.data() + 12, pkt.size() - 12), 0);
+}
+
 // ---------- end-to-end on the pure path ----------
 
 static void test_query_to_answer() {
@@ -436,6 +455,7 @@ int main() {
   RUN_SUITE(test_is_blocked_domain);
   RUN_SUITE(test_parse_query);
   RUN_SUITE(test_build_blocked_response);
+  RUN_SUITE(test_build_servfail_response);
   RUN_SUITE(test_query_to_answer);
   RUN_SUITE(test_valid_domain);
   RUN_SUITE(test_normalize_domain);
