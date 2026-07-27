@@ -42,6 +42,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install --upgrade platformio
 
+      - name: Create Dummy Secrets
+        run: cp src/secrets.example.h src/secrets.h
+
       - name: Build Firmware
         run: pio run
 
