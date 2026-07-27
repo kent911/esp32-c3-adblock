@@ -16,7 +16,7 @@
 #include "lwip/etharp.h"
 #include "lwip/netif.h"
 #include "dns_core.h"   // pure hashing / DNS logic, unit-tested natively (test/native)
-#include "secrets.h"   // defines WIFI_SSID / WIFI_PASS — copy secrets.example.h and fill in
+#include "secrets.h"   // WIFI_SSID / WIFI_PASS / DASH_USER / DASH_PASS / OTA_PASS — copy secrets.example.h and fill in
 
 // ---- config ----
 static const IPAddress UPSTREAM(9, 9, 9, 9);     // Quad9
@@ -62,18 +62,28 @@ static bool isBlocked(const char* domain) {
 }
 
 // ---------- persistence ----------
+// A domain label set: letters, digits, '-', '.'. Anything else (quotes, angle
+// brackets, control chars) is rejected so stored values can never carry markup.
+static bool validDomain(const String& d) {
+  if (d.length() < 3 || d.length() > 253) return false;
+  for (char ch : d) {
+    bool ok = (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '.';
+    if (!ok) return false;
+  }
+  return d.indexOf('.') > 0 && !d.startsWith(".") && !d.endsWith(".") && d.indexOf("..") < 0;
+}
 static void loadCustom() {
   numCustom = 0; File f = LittleFS.open("/custom.txt", "r"); if (!f) return;
   while (f.available() && numCustom < MAX_CUSTOM) {
     String l = f.readStringUntil('\n'); l.trim(); l.toLowerCase();
-    if (l.length() && l.indexOf('.') > 0) { customDom[numCustom] = l; customHash[numCustom] = fnv40(l.c_str(), l.length()); numCustom++; }
+    if (validDomain(l)) { customDom[numCustom] = l; customHash[numCustom] = fnv40(l.c_str(), l.length()); numCustom++; }
   }
   f.close();
 }
 static void saveCustom() { File f = LittleFS.open("/custom.txt", "w"); if (!f) return; for (int i = 0; i < numCustom; i++) f.println(customDom[i]); f.close(); }
 static bool addCustom(String d) {
   d.trim(); d.toLowerCase(); if (d.startsWith("www.")) d = d.substring(4);
-  if (!d.length() || d.indexOf('.') < 0 || numCustom >= MAX_CUSTOM) return false;
+  if (!validDomain(d) || numCustom >= MAX_CUSTOM) return false;
   for (int i = 0; i < numCustom; i++) if (customDom[i] == d) return false;
   customDom[numCustom] = d; customHash[numCustom] = fnv40(d.c_str(), d.length()); numCustom++; saveCustom(); return true;
 }
@@ -141,7 +151,48 @@ static void handleDns() {
 
 // ---------- web ----------
 static String macStr(const uint8_t* m) { char s[18]; snprintf(s, sizeof(s), "%02x:%02x:%02x:%02x:%02x:%02x", m[0],m[1],m[2],m[3],m[4],m[5]); return String(s); }
-static String jesc(const String& s) { String o; for (char ch : s) { if (ch == '"' || ch == '\\') o += '\\'; o += ch; } return o; }
+static String jesc(const String& s) {
+  String o;
+  for (char ch : s) {
+    if (ch == '"' || ch == '\\') { o += '\\'; o += ch; }
+    else if ((uint8_t)ch < 0x20) { char u[7]; snprintf(u, sizeof(u), "\\u%04x", ch); o += u; }
+    else o += ch;
+  }
+  return o;
+}
+
+// ---------- access control ----------
+// Everything below is reachable from any host on the LAN, including firmware
+// flashing, so every handler goes through requireAuth() first.
+static bool authEnabled() { return DASH_PASS && DASH_PASS[0]; }
+
+// A page on another origin can make the browser replay cached basic-auth
+// credentials, so cross-origin state changes are refused outright and requests
+// carrying a foreign Host header (DNS rebinding) are dropped.
+static bool sameOrigin() {
+  String origin = web.header("Origin");
+  if (!origin.length()) return true;                 // non-browser client / same-origin GET
+  String host = web.header("Host");
+  return host.length() && (origin.endsWith("://" + host));
+}
+static bool hostAllowed() {
+  String host = web.header("Host"); int c = host.indexOf(':'); if (c >= 0) host = host.substring(0, c);
+  if (!host.length()) return false;
+  IPAddress ip;
+  return host == "c3adblock.local" || (ip.fromString(host) && ip == WiFi.localIP());
+}
+static bool authOk() {                               // silent check, for upload body handlers
+  if (!hostAllowed() || !sameOrigin()) return false;
+  return !authEnabled() || web.authenticate(DASH_USER, DASH_PASS);
+}
+static bool requireAuth() {
+  if (!hostAllowed() || !sameOrigin()) { web.send(403, "text/plain", "forbidden"); return false; }
+  if (!authEnabled()) return true;
+  if (web.authenticate(DASH_USER, DASH_PASS)) return true;
+  web.requestAuthentication(DIGEST_AUTH, "C3 AdBlock", "authentication required");
+  return false;
+}
+static void guarded(void (*fn)()) { if (requireAuth()) fn(); }
 
 const char PAGE[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <title>C3 AdBlock</title><style>
@@ -176,22 +227,24 @@ h2{font-size:14px;color:#8b949e;margin:18px 0 8px}
 <form id=fwf style=margin-bottom:6px><input type=file id=fwb accept=.bin><button>Flash firmware</button> <span id=fwmsg style=color:#8b949e></span></form>
 <div style="color:#8b949e;font-size:12px;margin-bottom:18px">upload <code>.pio/build/c3/firmware.bin</code> &mdash; device verifies it and reboots into it</div>
 </div><script>
-function fmt(n){return n.toLocaleString()}
+function fmt(n){return Number(n).toLocaleString()}
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 async function load(){let s=await(await fetch('/stats.json')).json();
 host.textContent='@ '+s.ip;
 sys.innerHTML=[['Total blocked',fmt(s.blocked),'b'],['Total allowed',fmt(s.allowed),'a'],['Blocklist',fmt(s.domains)+' domains',''],
 ['Clients',s.clients.length,''],['WiFi',s.rssi+' dBm',''],['Temp',s.temp+' °C',''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,'']]
-.map(c=>`<div class=card><div class="v ${c[2]}">${c[1]}</div><div class=l>${c[0]}</div></div>`).join('');
+.map(c=>`<div class=card><div class="v ${c[2]}">${esc(c[1])}</div><div class=l>${c[0]}</div></div>`).join('');
 ct.tBodies[0].innerHTML=s.clients.sort((a,b)=>(b.blocked+b.allowed)-(a.blocked+a.allowed)).map(c=>
-`<tr><td>${c.ip}${c.banned?' <span class=tag style=color:#f85149>BANNED</span>':''}</td><td>${c.mac}</td>
+`<tr><td>${esc(c.ip)}${c.banned?' <span class=tag style=color:#f85149>BANNED</span>':''}</td><td>${esc(c.mac)}</td>
 <td class=b>${fmt(c.blocked)}</td><td class=a>${fmt(c.allowed)}</td>
-<td><button class=ban onclick="fetch('/ban?ip=${c.ip}').then(load)">${c.banned?'Unban':'Ban'}</button></td></tr>`).join('');
-cl.tBodies[0].innerHTML=s.custom.map(d=>`<tr><td>${d}</td><td style=text-align:right><button onclick="fetch('/unblock?d='+encodeURIComponent('${d}')).then(load)">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet</td></tr>';
+<td><button class=ban onclick="fetch('/ban?ip='+encodeURIComponent('${esc(c.ip)}')).then(load)">${c.banned?'Unban':'Ban'}</button></td></tr>`).join('');
+cl.tBodies[0].innerHTML=s.custom.map(d=>`<tr><td>${esc(d)}</td><td style=text-align:right><button onclick="fetch('/unblock?d='+encodeURIComponent('${esc(d)}')).then(load)">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet</td></tr>';
 if(document.activeElement!=uurl)uurl.value=s.upurl||'';
 if(document.activeElement!=uiv)uiv.value=s.upiv||24;
 ustat.textContent=s.upstat||'—';}
 function addDom(){let d=dom.value.trim();if(d){fetch('/addblock?d='+encodeURIComponent(d)).then(()=>{dom.value='';load()})}}
-function saveUpd(){fetch('/setupdate?u='+encodeURIComponent(uurl.value.trim())+'&h='+(parseInt(uiv.value)||24)).then(load)}
+function saveUpd(){let u=uurl.value.trim();if(u&&!/^https?:\/\//.test(u)){ustat.textContent='url must start with http:// or https://';return}
+fetch('/setupdate?u='+encodeURIComponent(u)+'&h='+(parseInt(uiv.value)||24)).then(load)}
 function fetchNow(){ustat.textContent='fetching...';fetch('/fetchnow').then(r=>r.text()).then(t=>{ustat.textContent=t;load()})}
 fwf.onsubmit=async e=>{e.preventDefault();let f=fwb.files[0];if(!f)return;fwmsg.textContent='flashing '+(f.size/1048576).toFixed(2)+' MB...';
 let fd=new FormData();fd.append('f',f);
@@ -250,14 +303,17 @@ static bool commitNewBlocklist() {                  // /blocklist.new -> live (v
 }
 
 // ---------- OTA blocklist update (browser upload) ----------
-static bool upOk = false;
+static bool upOk = false, upAuthOk = false;
 static File upFile;
 static void handleUploadDone() {
+  if (!upAuthOk) { requireAuth(); return; }
   web.send(upOk ? 200 : 500, "text/plain",
            upOk ? "ok" : "rejected: empty or size not a multiple of 5 (not a blocklist.bin?)");
 }
 static void handleUpload() {
   HTTPUpload& u = web.upload();
+  if (u.status == UPLOAD_FILE_START) upAuthOk = authOk();   // body handler runs before the final handler
+  if (!upAuthOk) return;
   switch (u.status) {
     case UPLOAD_FILE_START:
       upOk = false; beginBlocklistSwap();
@@ -291,8 +347,16 @@ static void saveUpdateCfg() {
   File f = LittleFS.open("/update.cfg", "w"); if (!f) return;
   f.println(updateUrl); f.println(updateIntervalH); f.close();
 }
+// Only plain http(s) URLs are accepted; the device fetches them itself, so a
+// bad URL turns it into a request proxy for whatever it can reach.
+static bool validUpdateUrl(const String& u) {
+  if (!(u.startsWith("http://") || u.startsWith("https://")) || u.length() > 300) return false;
+  for (char ch : u) if ((uint8_t)ch <= 0x20 || (uint8_t)ch >= 0x7f) return false;
+  return true;
+}
 static bool fetchBlocklist(String url) {
   url.trim(); if (!url.length()) { updateStatus = "no url set"; return false; }
+  if (!validUpdateUrl(url)) { updateStatus = "bad url"; return false; }
   Serial.printf("[remote] GET %s\n", url.c_str());
   WiFiClientSecure cs; cs.setInsecure();            // blocklist isn't secret -> skip cert pinning
   WiFiClient cl;
@@ -320,13 +384,17 @@ static bool fetchBlocklist(String url) {
 }
 
 // ---------- firmware OTA (browser upload of firmware.bin -> reboot) ----------
+static bool fwAuthOk = false;
 static void handleFwUpdateDone() {
+  if (!fwAuthOk) { requireAuth(); return; }
   bool ok = !Update.hasError();
   web.send(ok ? 200 : 500, "text/plain", ok ? "ok, rebooting" : "firmware update failed");
   if (ok) { delay(300); ESP.restart(); }
 }
 static void handleFwUpload() {
   HTTPUpload& u = web.upload();
+  if (u.status == UPLOAD_FILE_START) fwAuthOk = authOk();
+  if (!fwAuthOk) return;
   if (u.status == UPLOAD_FILE_START) {
     Serial.printf("[fw-ota] %s\n", u.filename.c_str());
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
@@ -355,27 +423,35 @@ void setup() {
   if (MDNS.begin("c3adblock")) { MDNS.addService("http", "tcp", 80); Serial.println("dashboard: http://c3adblock.local"); }
 
   dnsServer.begin(DNS_PORT); upstreamCli.begin(0);
-  web.on("/", []() { web.send_P(200, "text/html", PAGE); });
-  web.on("/stats.json", handleStats);
-  web.on("/ban", handleBan);
-  web.on("/addblock", []() { addCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
-  web.on("/unblock", []() { removeCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
+  const char* headerKeys[] = {"Host", "Origin"};
+  web.collectHeaders(headerKeys, 2);
+  web.on("/", []() { guarded([]() { web.send_P(200, "text/html", PAGE); }); });
+  web.on("/stats.json", []() { guarded(handleStats); });
+  web.on("/ban", []() { guarded(handleBan); });
+  web.on("/addblock", []() { guarded([]() { addCustom(web.arg("d")); web.send(200, "text/plain", "ok"); }); });
+  web.on("/unblock", []() { guarded([]() { removeCustom(web.arg("d")); web.send(200, "text/plain", "ok"); }); });
   web.on("/upload", HTTP_POST, handleUploadDone, handleUpload);      // blocklist OTA
   web.on("/update", HTTP_POST, handleFwUpdateDone, handleFwUpload);  // firmware OTA
-  web.on("/fetchnow", []() { fetchBlocklist(updateUrl); web.send(200, "text/plain", updateStatus); });
-  web.on("/setupdate", []() {
-    if (web.hasArg("u")) updateUrl = web.arg("u");
+  web.on("/fetchnow", []() { guarded([]() { fetchBlocklist(updateUrl); web.send(200, "text/plain", updateStatus); }); });
+  web.on("/setupdate", []() { guarded([]() {
+    if (web.hasArg("u")) {
+      String u = web.arg("u"); u.trim();
+      if (u.length() && !validUpdateUrl(u)) { web.send(400, "text/plain", "bad url"); return; }
+      updateUrl = u;
+    }
     if (web.hasArg("h")) { updateIntervalH = web.arg("h").toInt(); if (updateIntervalH < 1) updateIntervalH = 1; }
     saveUpdateCfg(); web.send(200, "text/plain", "ok");
-  });
+  }); });
+  if (!authEnabled()) Serial.println("WARNING: DASH_PASS empty -> dashboard and firmware OTA are unauthenticated");
   web.begin();
   ArduinoOTA.setHostname("c3adblock");   // pio run -t upload --upload-port c3adblock.local
-  ArduinoOTA.begin();
+  if (OTA_PASS && OTA_PASS[0]) { ArduinoOTA.setPassword(OTA_PASS); ArduinoOTA.begin(); }
+  else Serial.println("[ota] OTA_PASS empty -> network flashing disabled");
   Serial.println("DNS :53 + dashboard :80 + OTA up");
 }
 
 void loop() {
-  ArduinoOTA.handle();
+  if (OTA_PASS && OTA_PASS[0]) ArduinoOTA.handle();
   web.handleClient();
   handleDns();
   if (updateUrl.length()) {               // periodic remote blocklist auto-update

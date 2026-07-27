@@ -61,9 +61,9 @@ Printing notes:
 One USB flash to get going — after that, **firmware and blocklist both update over WiFi** (see below).
 
 ```bash
-# 1. set your WiFi creds (secrets.h is gitignored, so they stay local)
+# 1. set your WiFi creds + dashboard/OTA passwords (secrets.h is gitignored)
 cp src/secrets.example.h src/secrets.h
-#    then edit src/secrets.h -> WIFI_SSID / WIFI_PASS
+#    then edit src/secrets.h -> WIFI_SSID / WIFI_PASS / DASH_USER / DASH_PASS / OTA_PASS
 
 # 2. build the blocklist hash table (default = StevenBlack base + Hagezi Light,
 #    ~140k domains, WhatsApp/social safe)
@@ -87,12 +87,28 @@ The dashboard at **http://c3adblock.local** does it all:
 - **Firmware** — upload `.pio/build/c3/firmware.bin` under *Firmware → OTA update*; the
   device verifies it and reboots into the new image. Or push over WiFi from the CLI:
   ```bash
-  pio run -t upload --upload-port c3adblock.local --upload-protocol espota
+  pio run -t upload --upload-port c3adblock.local --upload-protocol espota --upload-flags --auth=$OTA_PASS
   ```
 
 **4 MB flash tradeoff:** firmware OTA needs *two* app slots, which leaves ~1.3 MB for the
 blocklist (**~250k domains max**). The aggressive 537k "ultimate" list only fits the
 single-app partition table (no firmware OTA). Pick your tradeoff in `partitions.csv`.
+
+## Security
+
+The dashboard can flash firmware, so it is password protected:
+
+- **Dashboard login** — `DASH_USER` / `DASH_PASS` in `secrets.h` guard every endpoint
+  (stats, ban, custom domains, blocklist upload, firmware OTA) with HTTP digest auth.
+  An empty `DASH_PASS` disables the login and the device says so on the serial console.
+- **espota** — network flashing requires `OTA_PASS`; leaving it empty disables espota.
+- **Cross-site / rebinding** — requests with a foreign `Origin`, or a `Host` that is
+  neither `c3adblock.local` nor the device IP, are rejected, so a web page you visit
+  can't drive the dashboard with your cached credentials.
+- Traffic is plain HTTP on your LAN; the credentials protect against casual access,
+  not against someone sniffing your own network.
+- The remote blocklist fetch does not verify the server certificate. Only point it at a
+  URL you control; a MITM can substitute the list (it can only over/under-block).
 
 ## Use it
 
