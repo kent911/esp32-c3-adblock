@@ -106,6 +106,30 @@ inline bool validDomain(const char* d, size_t n) {
   return hasDot;
 }
 
+// Same normalisation as tools/build_blocklist.py norm(): trim, lowercase, drop
+// leading '*'/'.' and trailing '.', drop a "www." prefix. Writes into `out`
+// (capacity `cap`, including the NUL) and returns it; input longer than the
+// buffer is truncated.
+inline const char* normalizeDomain(const char* in, char* out, size_t cap) {
+  const char* end = in + strlen(in);
+  while (in < end && (uint8_t)*in <= ' ') in++;
+  while (end > in && (uint8_t)end[-1] <= ' ') end--;
+  size_t n = (size_t)(end - in);
+  if (n > cap - 1) n = cap - 1;
+  for (size_t i = 0; i < n; i++) {
+    char c = in[i];
+    out[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+  }
+  size_t start = 0;
+  while (start < n && (out[start] == '*' || out[start] == '.')) start++;
+  while (n > start && out[n - 1] == '.') n--;
+  if (n - start >= 4 && strncmp(out + start, "www.", 4) == 0) start += 4;
+  n -= start;
+  memmove(out, out + start, n);
+  out[n] = 0;
+  return out;
+}
+
 // Appends `s` to `out` (Arduino String or std::string) escaped for a JSON
 // string literal.
 template <typename Str>

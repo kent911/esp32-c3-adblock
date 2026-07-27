@@ -36,6 +36,18 @@ def run_builder(builder, monkeypatch, capsys):
 
 
 @pytest.fixture(scope='session')
+def normalize_vectors():
+    """(raw, normalised) pairs shared with the firmware's native tests."""
+    vectors = []
+    for line in (FIXTURES / 'normalize_vectors.txt').read_text().splitlines():
+        line = line.split('#', 1)[0].strip()
+        if line:
+            raw, expected = line.split()
+            vectors.append((raw, expected))
+    return vectors
+
+
+@pytest.fixture(scope='session')
 def hash_vectors():
     """(domain, hash) pairs shared with the firmware's native tests."""
     vectors = []

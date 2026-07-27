@@ -17,11 +17,16 @@
 #include "lwip/netif.h"
 #include "dns_core.h"   // pure hashing / DNS logic, unit-tested natively (test/native)
 #include "secrets.h"   // WIFI_SSID / WIFI_PASS / DASH_USER / DASH_PASS / OTA_PASS — copy secrets.example.h and fill in
+#include "util.h"      // shared fs / domain / formatting helpers
 
 // ---- config ----
 static const IPAddress UPSTREAM(9, 9, 9, 9);     // Quad9
 static const uint16_t DNS_PORT = 53;
 static const char* BLOCKLIST_PATH = "/blocklist.bin";
+static const char* BLOCKLIST_TMP_PATH = "/blocklist.new";
+static const char* CUSTOM_PATH = "/custom.txt";
+static const char* BANNED_PATH = "/banned.txt";
+static const char* UPDATE_CFG_PATH = "/update.cfg";
 static const int HASH_BYTES = dnscore::HASH_BYTES;
 
 // ---- globals ----
@@ -56,49 +61,48 @@ static bool inFlash(uint64_t h) {
     return dnscore::decodeHash(b);
   });
 }
-static bool inCustom(uint64_t h) { for (int i = 0; i < numCustom; i++) if (customHash[i] == h) return true; return false; }
+static bool inCustom(uint64_t h) { return indexOfValue(customHash, numCustom, h) >= 0; }
 static bool isBlocked(const char* domain) {
   return dnscore::isBlockedDomain(domain, [](uint64_t h) { return inFlash(h) || inCustom(h); });
 }
 
 // ---------- persistence ----------
-// A domain label set: letters, digits, '-', '.'. Anything else (quotes, angle
-// brackets, control chars) is rejected so stored values can never carry markup.
-static bool validDomain(const String& d) { return dnscore::validDomain(d.c_str(), d.length()); }
-static void loadCustom() {
-  numCustom = 0; File f = LittleFS.open("/custom.txt", "r"); if (!f) return;
-  while (f.available() && numCustom < MAX_CUSTOM) {
-    String l = f.readStringUntil('\n'); l.trim(); l.toLowerCase();
-    if (validDomain(l)) { customDom[numCustom] = l; customHash[numCustom] = fnv40(l.c_str(), l.length()); numCustom++; }
-  }
-  f.close();
+static void saveCustom() { fsWriteLines(CUSTOM_PATH, numCustom, [](int i) { return customDom[i]; }); }
+static bool addCustomEntry(const String& d) {   // in-memory insert, no flash write
+  if (!isValidDomain(d) || numCustom >= MAX_CUSTOM) return false;
+  if (indexOfValue(customDom, numCustom, d) >= 0) return false;
+  customDom[numCustom] = d; customHash[numCustom] = fnv40(d.c_str(), d.length()); numCustom++;
+  return true;
 }
-static void saveCustom() { File f = LittleFS.open("/custom.txt", "w"); if (!f) return; for (int i = 0; i < numCustom; i++) f.println(customDom[i]); f.close(); }
+static void loadCustom() {
+  numCustom = 0;
+  fsReadLines(CUSTOM_PATH, [](const String& l) { addCustomEntry(normalizeDomain(l)); return numCustom < MAX_CUSTOM; });
+}
 static bool addCustom(String d) {
-  d.trim(); d.toLowerCase(); if (d.startsWith("www.")) d = d.substring(4);
-  if (!validDomain(d) || numCustom >= MAX_CUSTOM) return false;
-  for (int i = 0; i < numCustom; i++) if (customDom[i] == d) return false;
-  customDom[numCustom] = d; customHash[numCustom] = fnv40(d.c_str(), d.length()); numCustom++; saveCustom(); return true;
+  if (!addCustomEntry(normalizeDomain(d))) return false;
+  saveCustom(); return true;
 }
 static void removeCustom(String d) {
-  d.toLowerCase();
-  for (int i = 0; i < numCustom; i++) if (customDom[i] == d) {
-    for (int j = i; j < numCustom - 1; j++) { customDom[j] = customDom[j+1]; customHash[j] = customHash[j+1]; }
-    numCustom--; saveCustom(); return;
-  }
+  int i = indexOfValue(customDom, numCustom, normalizeDomain(d));
+  if (i < 0) return;
+  int nDom = numCustom, nHash = numCustom;
+  removeAt(customDom, nDom, i); removeAt(customHash, nHash, i);
+  numCustom = nDom;
+  saveCustom();
 }
-static bool isBannedIP(uint32_t ip) { for (int i = 0; i < numBanned; i++) if (bannedIP[i] == ip) return true; return false; }
+static bool isBannedIP(uint32_t ip) { return indexOfValue(bannedIP, numBanned, ip) >= 0; }
 static void loadBanned() {
-  numBanned = 0; File f = LittleFS.open("/banned.txt", "r"); if (!f) return;
-  while (f.available() && numBanned < MAX_BAN) { String l = f.readStringUntil('\n'); l.trim(); IPAddress ip; if (l.length() && ip.fromString(l)) bannedIP[numBanned++] = (uint32_t)ip; }
-  f.close();
+  numBanned = 0;
+  fsReadLines(BANNED_PATH, [](const String& l) {
+    IPAddress ip;
+    if (l.length() && ip.fromString(l)) bannedIP[numBanned++] = (uint32_t)ip;
+    return numBanned < MAX_BAN;
+  });
 }
 static void saveBanned() {
   numBanned = 0;
   for (int i = 0; i < numClients && numBanned < MAX_BAN; i++) if (clients[i].banned) bannedIP[numBanned++] = clients[i].ip;
-  File f = LittleFS.open("/banned.txt", "w"); if (!f) return;
-  for (int i = 0; i < numBanned; i++) { IPAddress ip(bannedIP[i]); f.println(ip.toString()); }
-  f.close();
+  fsWriteLines(BANNED_PATH, numBanned, [](int i) { return IPAddress(bannedIP[i]).toString(); });
 }
 
 // ---------- client table ----------
@@ -141,10 +145,6 @@ static void handleDns() {
   else         { rlen = forwardUpstream(qlen);     totalAllowed++; if (c) c->allowed++; }
   if (rlen > 0) { dnsServer.beginPacket(cip, cport); dnsServer.write(buf, rlen); dnsServer.endPacket(); }
 }
-
-// ---------- web ----------
-static String macStr(const uint8_t* m) { char s[18]; snprintf(s, sizeof(s), "%02x:%02x:%02x:%02x:%02x:%02x", m[0],m[1],m[2],m[3],m[4],m[5]); return String(s); }
-static String jesc(const String& s) { String o; dnscore::appendJsonEscaped(o, s.c_str()); return o; }
 
 // ---------- access control ----------
 // Everything below is reachable from any host on the LAN, including firmware
@@ -245,23 +245,21 @@ load();setInterval(load,3000);
 </script></body></html>)HTML";
 
 static void handleStats() {
-  uint32_t up = millis() / 1000;
-  char ut[24]; snprintf(ut, sizeof(ut), "%lud %luh %lum", up/86400, (up%86400)/3600, (up%3600)/60);
-  String j = "{\"ip\":\"" + WiFi.localIP().toString() + "\",\"blocked\":" + totalBlocked + ",\"allowed\":" + totalAllowed +
+  String j = "{\"ip\":" + jsonString(WiFi.localIP().toString()) + ",\"blocked\":" + totalBlocked + ",\"allowed\":" + totalAllowed +
              ",\"domains\":" + numHashes + ",\"rssi\":" + WiFi.RSSI() + ",\"temp\":" + String(temperatureRead(), 1) +
-             ",\"heap\":" + ESP.getFreeHeap() + ",\"uptime\":\"" + ut + "\"" +
-             ",\"upurl\":\"" + jesc(updateUrl) + "\",\"upiv\":" + updateIntervalH + ",\"upstat\":\"" + jesc(updateStatus) + "\"" +
+             ",\"heap\":" + ESP.getFreeHeap() + ",\"uptime\":" + jsonString(uptimeToString(millis() / 1000)) +
+             ",\"upurl\":" + jsonString(updateUrl) + ",\"upiv\":" + updateIntervalH + ",\"upstat\":" + jsonString(updateStatus) +
              ",\"clients\":[";
-  for (int i = 0; i < numClients; i++) { Dev& c = clients[i]; IPAddress ip(c.ip);
-    j += (i ? "," : ""); j += "{\"ip\":\"" + ip.toString() + "\",\"mac\":\"" + macStr(c.mac) + "\",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed + ",\"banned\":" + (c.banned?"true":"false") + "}"; }
+  for (int i = 0; i < numClients; i++) { Dev& c = clients[i];
+    j += (i ? "," : ""); j += "{\"ip\":" + jsonString(IPAddress(c.ip).toString()) + ",\"mac\":" + jsonString(macToString(c.mac)) + ",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed + ",\"banned\":" + (c.banned?"true":"false") + "}"; }
   j += "],\"custom\":[";
-  for (int i = 0; i < numCustom; i++) { j += (i ? "," : ""); j += "\"" + jesc(customDom[i]) + "\""; }
+  for (int i = 0; i < numCustom; i++) { j += (i ? "," : ""); j += jsonString(customDom[i]); }
   j += "]}";
   web.send(200, "application/json", j);
 }
 static void handleBan() {
   IPAddress ip; if (ip.fromString(web.arg("ip"))) { Dev* c = getClient((uint32_t)ip); if (c) { c->banned = !c->banned; saveBanned(); } }
-  web.send(200, "text/plain", "ok");
+  sendPlain(web, "ok");
 }
 
 // ---------- blocklist swap (shared by upload + remote fetch) ----------
@@ -275,14 +273,18 @@ static void beginBlocklistSwap() {
   if (blocklist) blocklist.close();
   numHashes = 0;
   LittleFS.remove(BLOCKLIST_PATH);
-  LittleFS.remove("/blocklist.new");
+  LittleFS.remove(BLOCKLIST_TMP_PATH);
+}
+static void abortBlocklistSwap() {
+  LittleFS.remove(BLOCKLIST_TMP_PATH);
+  reopenBlocklist();
 }
 static bool commitNewBlocklist() {                  // /blocklist.new -> live (validated)
-  File f = LittleFS.open("/blocklist.new", "r");
+  File f = LittleFS.open(BLOCKLIST_TMP_PATH, "r");
   size_t sz = f ? f.size() : 0; if (f) f.close();
   bool ok = sz > 0 && (sz % HASH_BYTES) == 0;       // sorted hash blob -> 5-byte multiple
-  if (ok) LittleFS.rename("/blocklist.new", BLOCKLIST_PATH);
-  else    LittleFS.remove("/blocklist.new");
+  if (ok) LittleFS.rename(BLOCKLIST_TMP_PATH, BLOCKLIST_PATH);
+  else    LittleFS.remove(BLOCKLIST_TMP_PATH);
   reopenBlocklist();
   return ok;
 }
@@ -292,8 +294,7 @@ static bool upOk = false, upAuthOk = false;
 static File upFile;
 static void handleUploadDone() {
   if (!upAuthOk) { requireAuth(); return; }
-  web.send(upOk ? 200 : 500, "text/plain",
-           upOk ? "ok" : "rejected: empty or size not a multiple of 5 (not a blocklist.bin?)");
+  sendResult(web, upOk, "ok", "rejected: empty or size not a multiple of 5 (not a blocklist.bin?)");
 }
 static void handleUpload() {
   HTTPUpload& u = web.upload();
@@ -302,7 +303,7 @@ static void handleUpload() {
   switch (u.status) {
     case UPLOAD_FILE_START:
       upOk = false; beginBlocklistSwap();
-      upFile = LittleFS.open("/blocklist.new", "w");
+      upFile = LittleFS.open(BLOCKLIST_TMP_PATH, "w");
       Serial.printf("[ota] receiving %s\n", u.filename.c_str());
       break;
     case UPLOAD_FILE_WRITE:
@@ -315,22 +316,29 @@ static void handleUpload() {
       break;
     case UPLOAD_FILE_ABORTED:
       if (upFile) upFile.close();
-      LittleFS.remove("/blocklist.new"); reopenBlocklist();
+      abortBlocklistSwap();
       Serial.println("[ota] aborted");
       break;
   }
 }
 
 // ---------- remote blocklist auto-update ----------
+static void setUpdateIntervalH(uint32_t h) { updateIntervalH = h < 1 ? 1 : h; }
+static void setUpdateStatus(const String& s) {
+  updateStatus = s;
+  Serial.printf("[remote] %s\n", s.c_str());
+}
 static void loadUpdateCfg() {
-  File f = LittleFS.open("/update.cfg", "r"); if (!f) return;
-  updateUrl = f.readStringUntil('\n'); updateUrl.trim();
-  String iv = f.readStringUntil('\n'); iv.trim(); if (iv.length()) updateIntervalH = iv.toInt();
-  f.close(); if (updateIntervalH < 1) updateIntervalH = 1;
+  int line = 0;
+  fsReadLines(UPDATE_CFG_PATH, [&line](const String& l) {
+    if (line == 0) updateUrl = l;
+    else if (l.length()) setUpdateIntervalH(l.toInt());
+    return ++line < 2;
+  });
+  setUpdateIntervalH(updateIntervalH);
 }
 static void saveUpdateCfg() {
-  File f = LittleFS.open("/update.cfg", "w"); if (!f) return;
-  f.println(updateUrl); f.println(updateIntervalH); f.close();
+  fsWriteLines(UPDATE_CFG_PATH, 2, [](int i) { return i == 0 ? updateUrl : String(updateIntervalH); });
 }
 // Only plain http(s) URLs are accepted; the device fetches them itself, so a
 // bad URL turns it into a request proxy for whatever it can reach.
@@ -340,20 +348,20 @@ static bool validUpdateUrl(const String& u) {
   return true;
 }
 static bool fetchBlocklist(String url) {
-  url.trim(); if (!url.length()) { updateStatus = "no url set"; return false; }
-  if (!validUpdateUrl(url)) { updateStatus = "bad url"; return false; }
+  url.trim(); if (!url.length()) { setUpdateStatus("no url set"); return false; }
+  if (!validUpdateUrl(url)) { setUpdateStatus("bad url"); return false; }
   Serial.printf("[remote] GET %s\n", url.c_str());
   WiFiClientSecure cs; cs.setInsecure();            // blocklist isn't secret -> skip cert pinning
   WiFiClient cl;
   HTTPClient http; http.setTimeout(20000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);  // GitHub release -> CDN redirect
   bool https = url.startsWith("https");
-  if (!(https ? http.begin(cs, url) : http.begin(cl, url))) { updateStatus = "begin failed"; return false; }
+  if (!(https ? http.begin(cs, url) : http.begin(cl, url))) { setUpdateStatus("begin failed"); return false; }
   int code = http.GET();
-  if (code != HTTP_CODE_OK) { http.end(); updateStatus = "HTTP " + String(code); Serial.printf("[remote] %s\n", updateStatus.c_str()); return false; }
+  if (code != HTTP_CODE_OK) { http.end(); setUpdateStatus("HTTP " + String(code)); return false; }
   beginBlocklistSwap();
-  File f = LittleFS.open("/blocklist.new", "w");
-  if (!f) { http.end(); updateStatus = "fs open failed"; reopenBlocklist(); return false; }
+  File f = LittleFS.open(BLOCKLIST_TMP_PATH, "w");
+  if (!f) { http.end(); setUpdateStatus("fs open failed"); abortBlocklistSwap(); return false; }
   WiFiClient* stream = http.getStreamPtr();
   int len = http.getSize(); uint8_t b[1024]; size_t total = 0; uint32_t idle = millis();
   while (http.connected() && (len < 0 || (int)total < len)) {
@@ -363,8 +371,7 @@ static bool fetchBlocklist(String url) {
   }
   f.close(); http.end();
   bool ok = commitNewBlocklist();
-  updateStatus = ok ? ("ok: " + String(numHashes) + " domains") : ("bad data (" + String(total) + "B)");
-  Serial.printf("[remote] %s\n", updateStatus.c_str());
+  setUpdateStatus(ok ? ("ok: " + String(numHashes) + " domains") : ("bad data (" + String(total) + "B)"));
   return ok;
 }
 
@@ -373,7 +380,7 @@ static bool fwAuthOk = false;
 static void handleFwUpdateDone() {
   if (!fwAuthOk) { requireAuth(); return; }
   bool ok = !Update.hasError();
-  web.send(ok ? 200 : 500, "text/plain", ok ? "ok, rebooting" : "firmware update failed");
+  sendResult(web, ok, "ok, rebooting", "firmware update failed");
   if (ok) { delay(300); ESP.restart(); }
 }
 static void handleFwUpload() {
@@ -397,8 +404,8 @@ void setup() {
   Serial.begin(115200); delay(300);
   Serial.println("\n[c3-adblock] booting");
   if (!LittleFS.begin(true)) Serial.println("LittleFS FAILED");
-  blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
-  if (blocklist) { numHashes = blocklist.size() / HASH_BYTES; Serial.printf("blocklist: %u domains\n", numHashes); }
+  reopenBlocklist();
+  Serial.printf("blocklist: %u domains\n", numHashes);
   loadCustom(); loadBanned(); loadUpdateCfg();
   Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
 
@@ -413,19 +420,19 @@ void setup() {
   web.on("/", []() { guarded([]() { web.send_P(200, "text/html", PAGE); }); });
   web.on("/stats.json", []() { guarded(handleStats); });
   web.on("/ban", []() { guarded(handleBan); });
-  web.on("/addblock", []() { guarded([]() { addCustom(web.arg("d")); web.send(200, "text/plain", "ok"); }); });
-  web.on("/unblock", []() { guarded([]() { removeCustom(web.arg("d")); web.send(200, "text/plain", "ok"); }); });
+  web.on("/addblock", []() { guarded([]() { addCustom(web.arg("d")); sendPlain(web, "ok"); }); });
+  web.on("/unblock", []() { guarded([]() { removeCustom(web.arg("d")); sendPlain(web, "ok"); }); });
   web.on("/upload", HTTP_POST, handleUploadDone, handleUpload);      // blocklist OTA
   web.on("/update", HTTP_POST, handleFwUpdateDone, handleFwUpload);  // firmware OTA
-  web.on("/fetchnow", []() { guarded([]() { fetchBlocklist(updateUrl); web.send(200, "text/plain", updateStatus); }); });
+  web.on("/fetchnow", []() { guarded([]() { fetchBlocklist(updateUrl); sendPlain(web, updateStatus); }); });
   web.on("/setupdate", []() { guarded([]() {
     if (web.hasArg("u")) {
       String u = web.arg("u"); u.trim();
       if (u.length() && !validUpdateUrl(u)) { web.send(400, "text/plain", "bad url"); return; }
       updateUrl = u;
     }
-    if (web.hasArg("h")) { updateIntervalH = web.arg("h").toInt(); if (updateIntervalH < 1) updateIntervalH = 1; }
-    saveUpdateCfg(); web.send(200, "text/plain", "ok");
+    if (web.hasArg("h")) setUpdateIntervalH(web.arg("h").toInt());
+    saveUpdateCfg(); sendPlain(web, "ok");
   }); });
   if (!authEnabled()) Serial.println("WARNING: DASH_PASS empty -> dashboard and firmware OTA are unauthenticated");
   web.begin();

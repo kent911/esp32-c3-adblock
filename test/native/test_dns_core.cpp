@@ -366,6 +366,48 @@ static void test_valid_domain() {
   CHECK(!validStr(std::string(200, 'a') + "." + std::string(200, 'b')));  // 401 chars
 }
 
+static const char* normalized(const char* in, char* buf, size_t cap = 256) {
+  return dnscore::normalizeDomain(in, buf, cap);
+}
+
+static void test_normalize_domain() {
+  char buf[256];
+
+  TEST_CASE("matches the vectors shared with tools/build_blocklist.py norm()");
+  FILE* f = fopen("fixtures/normalize_vectors.txt", "r");
+  CHECK(f != nullptr);
+  if (!f) return;
+  char line[512], raw[256], want[256]; int checked = 0;
+  while (fgets(line, sizeof(line), f)) {
+    if (line[0] == '#' || line[0] == '\n') continue;
+    if (sscanf(line, "%255s %255s", raw, want) != 2) continue;
+    CHECK_EQ_STR(normalized(raw, buf), want);
+    checked++;
+  }
+  fclose(f);
+  CHECK(checked >= 10);
+
+  TEST_CASE("surrounding whitespace is trimmed");
+  CHECK_EQ_STR(normalized("  example.com \r\n", buf), "example.com");
+  CHECK_EQ_STR(normalized("\t www.Example.COM. ", buf), "example.com");
+
+  TEST_CASE("degenerate inputs collapse to empty rather than reading past the buffer");
+  CHECK_EQ_STR(normalized("", buf), "");
+  CHECK_EQ_STR(normalized("   ", buf), "");
+  CHECK_EQ_STR(normalized("...", buf), "");
+  CHECK_EQ_STR(normalized("www.", buf), "www");   // trailing dot goes first, so no prefix left to strip
+
+  TEST_CASE("output is truncated to the buffer, never overflowed");
+  std::string longInput(500, 'a');
+  char small[16];
+  const char* got = dnscore::normalizeDomain(longInput.c_str(), small, sizeof(small));
+  CHECK_EQ_INT(strlen(got), 15);
+
+  TEST_CASE("normalising twice is a no-op");
+  char again[256];
+  CHECK_EQ_STR(normalized(normalized("*.WWW.Example.com.", buf), again), "example.com");
+}
+
 static void test_json_escaping() {
   Escaper escaped;
 
@@ -396,6 +438,7 @@ int main() {
   RUN_SUITE(test_build_blocked_response);
   RUN_SUITE(test_query_to_answer);
   RUN_SUITE(test_valid_domain);
+  RUN_SUITE(test_normalize_domain);
   RUN_SUITE(test_json_escaping);
   return TEST_MAIN_RESULT();
 }

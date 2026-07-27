@@ -59,6 +59,11 @@ def test_norm(builder, raw, expected):
     assert builder.norm(raw) == expected
 
 
+def test_norm_matches_shared_vectors(builder, normalize_vectors):
+    for raw, expected in normalize_vectors:
+        assert builder.norm(raw) == expected, raw
+
+
 # ---------- read_source ----------
 
 def test_read_source_prefers_a_local_file(builder, tmp_path, monkeypatch):
