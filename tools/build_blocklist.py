@@ -6,10 +6,13 @@ device, so no PSRAM is needed.
 HASH_BYTES MUST match the firmware (src/main.cpp). 5 bytes (40-bit) keeps
 ~0 collisions up to ~500k domains while fitting half a million in <3 MB.
 
-Usage: build_blocklist.py [out.bin] [src ...]
+Usage: build_blocklist.py [--allow-partial] [out.bin] [src ...]
   src = local file or URL. With none given, downloads a balanced daily-driver set
   (StevenBlack base + Hagezi Pro) ~= 200k domains: blocks ads/trackers/malware
   but leaves WhatsApp/Instagram/social/messaging working.
+
+  A source that fails to download aborts the build (exit 1) so a half-built
+  list never overwrites a good one -- pass --allow-partial to build anyway.
 
   For the aggressive "test the limits" build (~500k, also blocks social/messaging):
     build_blocklist.py blocklist.bin \\
@@ -51,15 +54,18 @@ def read_source(src: str) -> str:
 
 def main():
     args = sys.argv[1:]
+    allow_partial = '--allow-partial' in args
+    args = [a for a in args if a != '--allow-partial']
     out = args[0] if args else 'blocklist.bin'
     sources = args[1:] if len(args) > 1 else DEFAULT_SOURCES
 
     domains = set()
+    failed = []
     for src in sources:
         try:
             data = read_source(src)
         except Exception as e:
-            print(f'  !! skipped {src}: {e}', file=sys.stderr); continue
+            print(f'  !! failed {src}: {e}', file=sys.stderr); failed.append(src); continue
         for line in data.splitlines():
             line = line.split('#', 1)[0].strip()
             if not line or line[0] in '!/':
@@ -72,12 +78,21 @@ def main():
                 if '.' in d and ' ' not in d:
                     domains.add(d)
 
+    if failed and not allow_partial:
+        sys.exit(f'error: {len(failed)}/{len(sources)} source(s) unreachable, '
+                 f'{out} left untouched (use --allow-partial to override)')
+    if not domains:
+        sys.exit('error: no domains parsed from any source, refusing to write an empty blocklist')
+
     hashes = sorted(fnv(d.encode()) for d in domains)
     collisions = len(hashes) - len(set(hashes))
     uniq = sorted(set(hashes))                       # one entry per distinct hash
-    with open(out, 'wb') as f:
+    tmp = out + '.tmp'                               # write-then-replace: an interrupted
+    with open(tmp, 'wb') as f:                       # run can't leave a truncated blob
         for h in uniq:
             f.write(h.to_bytes(HASH_BYTES, 'little'))
+        f.flush(); os.fsync(f.fileno())
+    os.replace(tmp, out)
 
     n, size = len(uniq), len(uniq) * HASH_BYTES
     print(f'source domains   : {len(domains):,}')
@@ -85,6 +100,8 @@ def main():
     print(f'collisions       : {collisions}  (domains sharing a hash -> over-block)')
     print(f'flash blob       : {size:,} bytes  ({size/1024/1024:.2f} MB)  -> {out}')
     print(f'lookup           : ~{math.ceil(math.log2(max(n,2)))} reads/query')
+    if failed:
+        print(f'PARTIAL BUILD    : {len(failed)} source(s) failed: {", ".join(failed)}', file=sys.stderr)
 
 if __name__ == '__main__':
     main()
