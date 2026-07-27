@@ -169,18 +169,31 @@ def test_blob_is_sorted_little_endian_and_five_bytes_per_entry(builder, run_buil
     assert got == hashes_of(builder, *domains)
 
 
-def test_blob_is_empty_when_nothing_parses(run_builder, tmp_path):
-    _, got = build(run_builder, tmp_path, '# nothing here\n')
-    assert got == []
+def test_an_empty_result_is_refused_instead_of_written(run_builder, tmp_path):
+    with pytest.raises(SystemExit) as e:
+        build(run_builder, tmp_path, '# nothing here\n')
+    assert 'refusing to write an empty blocklist' in str(e.value)
+    assert not (tmp_path / 'blocklist.bin').exists()
 
 
-def test_a_failing_source_is_skipped_not_fatal(builder, run_builder, tmp_path):
+def test_a_failing_source_aborts_and_leaves_the_old_blob_alone(run_builder, tmp_path):
     good = tmp_path / 'good.txt'
     good.write_text('ads.example.com\n')
     out = tmp_path / 'out.bin'
-    captured, blob = run_builder(out, tmp_path / 'missing-file-or-url', good)
+    out.write_bytes(b'previous')
+    with pytest.raises(SystemExit) as e:
+        run_builder(out, tmp_path / 'missing-file-or-url', good)
+    assert '1/2 source(s) unreachable' in str(e.value)
+    assert out.read_bytes() == b'previous'          # a shrunken list must not be committed
+
+
+def test_allow_partial_keeps_going_when_a_source_fails(builder, run_builder, tmp_path):
+    good = tmp_path / 'good.txt'
+    good.write_text('ads.example.com\n')
+    out = tmp_path / 'out.bin'
+    captured, blob = run_builder(out, '--allow-partial', tmp_path / 'missing-file-or-url', good)
     assert decode_blob(blob) == hashes_of(builder, 'ads.example.com')
-    assert 'skipped' in captured.err
+    assert 'failed' in captured.err
 
 
 def test_summary_reports_entries_size_and_lookup_depth(run_builder, tmp_path):
