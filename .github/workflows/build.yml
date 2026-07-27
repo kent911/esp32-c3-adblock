@@ -16,7 +16,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-python-version: '3.10'
+          python-version: '3.10'
 
       - name: Generate Fresh Blocklist
         run: |
@@ -24,8 +24,14 @@ jobs:
 
       - name: Commit and Push changes
         run: |
+          set -euo pipefail
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           git add data/blocklist.bin
-          git commit -m "Auto-update blocklist.bin" || echo "No changes to commit"
+          # `|| true` on the commit would also hide a real commit failure
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "Auto-update blocklist.bin"
           git push

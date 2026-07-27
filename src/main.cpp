@@ -28,8 +28,18 @@ static const uint64_t HASH_MASK = (1ULL << (HASH_BYTES * 8)) - 1;
 WiFiUDP dnsServer, upstreamCli;
 WebServer web(80);
 File blocklist;
-uint32_t numHashes = 0, totalBlocked = 0, totalAllowed = 0;
+uint32_t numHashes = 0, totalBlocked = 0, totalAllowed = 0, totalFailed = 0;
 uint8_t buf[600];
+bool fsReady = false;
+
+// Serial is the only channel for background faults; rate-limit so a stuck
+// subsystem can't drown the console (or stall DNS) with one line per query.
+static void logThrottled(uint32_t& last, const char* msg) {
+  uint32_t now = millis();
+  if (last && now - last < 5000) return;
+  last = now ? now : 1;
+  Serial.println(msg);
+}
 
 struct Dev { uint32_t ip; uint8_t mac[6]; uint32_t blocked, allowed, lastSeen; bool banned; String label; };
 static const int MAX_CLIENTS = 96;
@@ -54,10 +64,16 @@ static uint64_t fnv40(const char* s, size_t n) {
   return h & HASH_MASK;
 }
 static bool inFlash(uint64_t h) {
+  if (!blocklist || !numHashes) return false;
+  static uint32_t lastReadErr = 0;
   int32_t lo = 0, hi = (int32_t)numHashes - 1; uint8_t b[HASH_BYTES];
   while (lo <= hi) {
     int32_t mid = (lo + hi) >> 1;
-    blocklist.seek((uint32_t)mid * HASH_BYTES); blocklist.read(b, HASH_BYTES);
+    if (!blocklist.seek((uint32_t)mid * HASH_BYTES) ||
+        blocklist.read(b, HASH_BYTES) != HASH_BYTES) {
+      logThrottled(lastReadErr, "[blocklist] flash read failed -> fail-open");
+      return false;
+    }
     uint64_t v = 0; for (int k = 0; k < HASH_BYTES; k++) v |= (uint64_t)b[k] << (8 * k);
     if (v < h) lo = mid + 1; else if (v > h) hi = mid - 1; else return true;
   }
@@ -77,39 +93,64 @@ static bool isBlocked(const char* domain) {
 
 // ---------- persistence ----------
 static void loadCustom() {
-  numCustom = 0; File f = LittleFS.open("/custom.txt", "r"); if (!f) return;
+  numCustom = 0;
+  if (!LittleFS.exists("/custom.txt")) return;
+  File f = LittleFS.open("/custom.txt", "r");
+  if (!f) { Serial.println("[fs] custom.txt open failed"); return; }
   while (f.available() && numCustom < MAX_CUSTOM) {
     String l = f.readStringUntil('\n'); l.trim(); l.toLowerCase();
     if (l.length() && l.indexOf('.') > 0) { customDom[numCustom] = l; customHash[numCustom] = fnv40(l.c_str(), l.length()); numCustom++; }
   }
   f.close();
 }
-static void saveCustom() { File f = LittleFS.open("/custom.txt", "w"); if (!f) return; for (int i = 0; i < numCustom; i++) f.println(customDom[i]); f.close(); }
-static bool addCustom(String d) {
-  d.trim(); d.toLowerCase(); if (d.startsWith("www.")) d = d.substring(4);
-  if (!d.length() || d.indexOf('.') < 0 || numCustom >= MAX_CUSTOM) return false;
-  for (int i = 0; i < numCustom; i++) if (customDom[i] == d) return false;
-  customDom[numCustom] = d; customHash[numCustom] = fnv40(d.c_str(), d.length()); numCustom++; saveCustom(); return true;
+static bool saveCustom() {
+  if (!fsReady) return false;
+  File f = LittleFS.open("/custom.txt", "w");
+  if (!f) { Serial.println("[fs] custom.txt write open failed"); return false; }
+  bool ok = true;
+  for (int i = 0; i < numCustom; i++) ok = f.println(customDom[i]) == customDom[i].length() + 2 && ok;
+  f.close();
+  if (!ok) Serial.println("[fs] custom.txt write failed (flash full?)");
+  return ok;
 }
-static void removeCustom(String d) {
+// Returns nullptr on success, otherwise a human-readable reason.
+static const char* addCustom(String d) {
+  d.trim(); d.toLowerCase(); if (d.startsWith("www.")) d = d.substring(4);
+  if (!d.length() || d.indexOf('.') < 0) return "not a domain";
+  if (numCustom >= MAX_CUSTOM) return "custom list full";
+  for (int i = 0; i < numCustom; i++) if (customDom[i] == d) return "already blocked";
+  customDom[numCustom] = d; customHash[numCustom] = fnv40(d.c_str(), d.length()); numCustom++;
+  return saveCustom() ? nullptr : "blocked, but saving to flash failed";
+}
+static const char* removeCustom(String d) {
   d.toLowerCase();
   for (int i = 0; i < numCustom; i++) if (customDom[i] == d) {
     for (int j = i; j < numCustom - 1; j++) { customDom[j] = customDom[j+1]; customHash[j] = customHash[j+1]; }
-    numCustom--; saveCustom(); return;
+    numCustom--;
+    return saveCustom() ? nullptr : "removed, but saving to flash failed";
   }
+  return "not in the custom list";
 }
 static bool isBannedIP(uint32_t ip) { for (int i = 0; i < numBanned; i++) if (bannedIP[i] == ip) return true; return false; }
 static void loadBanned() {
-  numBanned = 0; File f = LittleFS.open("/banned.txt", "r"); if (!f) return;
+  numBanned = 0;
+  if (!LittleFS.exists("/banned.txt")) return;
+  File f = LittleFS.open("/banned.txt", "r");
+  if (!f) { Serial.println("[fs] banned.txt open failed"); return; }
   while (f.available() && numBanned < MAX_BAN) { String l = f.readStringUntil('\n'); l.trim(); IPAddress ip; if (l.length() && ip.fromString(l)) bannedIP[numBanned++] = (uint32_t)ip; }
   f.close();
 }
-static void saveBanned() {
+static bool saveBanned() {
   numBanned = 0;
   for (int i = 0; i < numClients && numBanned < MAX_BAN; i++) if (clients[i].banned) bannedIP[numBanned++] = clients[i].ip;
-  File f = LittleFS.open("/banned.txt", "w"); if (!f) return;
-  for (int i = 0; i < numBanned; i++) { IPAddress ip(bannedIP[i]); f.println(ip.toString()); }
+  if (!fsReady) return false;
+  File f = LittleFS.open("/banned.txt", "w");
+  if (!f) { Serial.println("[fs] banned.txt write open failed"); return false; }
+  bool ok = true;
+  for (int i = 0; i < numBanned; i++) { String s = IPAddress(bannedIP[i]).toString(); ok = f.println(s) == s.length() + 2 && ok; }
   f.close();
+  if (!ok) Serial.println("[fs] banned.txt write failed (flash full?)");
+  return ok;
 }
 
 // ---------- client table ----------
@@ -126,6 +167,8 @@ static Dev* getClient(uint32_t ip) {
     c->ip = ip; c->blocked = c->allowed = 0; c->lastSeen = millis(); c->banned = isBannedIP(ip); c->label = "";
     getMac(ip, c->mac); return c;
   }
+  static uint32_t lastFull = 0;
+  logThrottled(lastFull, "[clients] table full -> stats for new clients not tracked");
   return nullptr;
 }
 
@@ -145,6 +188,13 @@ static int buildBlocked(int qend, uint16_t qtype) {
   const uint8_t ans[] = {0xC0,0x0C, 0,1, 0,1, 0,0,1,0x2C, 0,4, 0,0,0,0};
   memcpy(buf + qend, ans, sizeof(ans)); return qend + sizeof(ans);
 }
+// SERVFAIL over the original question: better an explicit failure than a
+// dropped packet the resolver has to time out on.
+static int buildServfail(int qend) {
+  buf[2] = 0x81; buf[3] = 0x82;
+  buf[6] = 0; buf[7] = 0; buf[8] = 0; buf[9] = 0; buf[10] = 0; buf[11] = 0;
+  return qend;
+}
 static int forwardUpstream(int qlen) {
   upstreamCli.beginPacket(UPSTREAM, 53); upstreamCli.write(buf, qlen); upstreamCli.endPacket();
   uint32_t t0 = millis();
@@ -162,7 +212,15 @@ static void handleDns() {
   bool blocked = ban || (dl && numHashes && isBlocked(domain));
   int rlen;
   if (blocked) { rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++; }
-  else         { rlen = forwardUpstream(qlen);     totalAllowed++; if (c) c->allowed++; }
+  else {
+    rlen = forwardUpstream(qlen);
+    if (rlen > 0) { totalAllowed++; if (c) c->allowed++; }
+    else {
+      static uint32_t lastUpErr = 0;
+      logThrottled(lastUpErr, "[dns] upstream timeout -> SERVFAIL");
+      totalFailed++; rlen = buildServfail(qend);
+    }
+  }
   if (rlen > 0) { dnsServer.beginPacket(cip, cport); dnsServer.write(buf, rlen); dnsServer.endPacket(); }
 }
 
@@ -207,19 +265,20 @@ function fmt(n){return n.toLocaleString()}
 async function load(){let s=await(await fetch('/stats.json')).json();
 host.textContent='@ '+s.ip;
 sys.innerHTML=[['Total blocked',fmt(s.blocked),'b'],['Total allowed',fmt(s.allowed),'a'],['Blocklist',fmt(s.domains)+' domains',''],
-['Clients',s.clients.length,''],['WiFi',s.rssi+' dBm',''],['Temp',s.temp+' °C',''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,'']]
+['Clients',s.clients.length,''],['Upstream fails',fmt(s.failed),s.failed?'b':''],['WiFi',s.rssi+' dBm',''],['Temp',s.temp+' °C',''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,'']]
 .map(c=>`<div class=card><div class="v ${c[2]}">${c[1]}</div><div class=l>${c[0]}</div></div>`).join('');
 ct.tBodies[0].innerHTML=s.clients.sort((a,b)=>(b.blocked+b.allowed)-(a.blocked+a.allowed)).map(c=>
 `<tr><td>${c.ip}${c.banned?' <span class=tag style=color:#f85149>BANNED</span>':''}</td><td>${c.mac}</td>
 <td class=b>${fmt(c.blocked)}</td><td class=a>${fmt(c.allowed)}</td>
-<td><button class=ban onclick="fetch('/ban?ip=${c.ip}').then(load)">${c.banned?'Unban':'Ban'}</button></td></tr>`).join('');
-cl.tBodies[0].innerHTML=s.custom.map(d=>`<tr><td>${d}</td><td style=text-align:right><button onclick="fetch('/unblock?d='+encodeURIComponent('${d}')).then(load)">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet</td></tr>';
+<td><button class=ban onclick="act('/ban?ip=${c.ip}')">${c.banned?'Unban':'Ban'}</button></td></tr>`).join('');
+cl.tBodies[0].innerHTML=s.custom.map(d=>`<tr><td>${d}</td><td style=text-align:right><button onclick="act('/unblock?d='+encodeURIComponent('${d}'))">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet</td></tr>';
 if(document.activeElement!=uurl)uurl.value=s.upurl||'';
 if(document.activeElement!=uiv)uiv.value=s.upiv||24;
 ustat.textContent=s.upstat||'—';}
-function addDom(){let d=dom.value.trim();if(d){fetch('/addblock?d='+encodeURIComponent(d)).then(()=>{dom.value='';load()})}}
-function saveUpd(){fetch('/setupdate?u='+encodeURIComponent(uurl.value.trim())+'&h='+(parseInt(uiv.value)||24)).then(load)}
-function fetchNow(){ustat.textContent='fetching...';fetch('/fetchnow').then(r=>r.text()).then(t=>{ustat.textContent=t;load()})}
+async function act(u){let r=await fetch(u);if(!r.ok)alert(await r.text());load();return r.ok}
+async function addDom(){let d=dom.value.trim();if(d&&await act('/addblock?d='+encodeURIComponent(d)))dom.value=''}
+function saveUpd(){act('/setupdate?u='+encodeURIComponent(uurl.value.trim())+'&h='+(parseInt(uiv.value)||24))}
+function fetchNow(){ustat.textContent='fetching...';fetch('/fetchnow').then(async r=>{ustat.textContent=await r.text();load()})}
 fwf.onsubmit=async e=>{e.preventDefault();let f=fwb.files[0];if(!f)return;fwmsg.textContent='flashing '+(f.size/1048576).toFixed(2)+' MB...';
 let fd=new FormData();fd.append('f',f);
 try{let r=await fetch('/update',{method:'POST',body:fd});fwmsg.textContent=r.ok?'✓ rebooting, reconnect in ~15s':'✗ '+await r.text();}
@@ -238,7 +297,7 @@ static void handleStats() {
   char ut[24]; snprintf(ut, sizeof(ut), "%lud %luh %lum", up/86400, (up%86400)/3600, (up%3600)/60);
   String j = "{\"ip\":\"" + WiFi.localIP().toString() + "\",\"blocked\":" + totalBlocked + ",\"allowed\":" + totalAllowed +
              ",\"domains\":" + numHashes + ",\"rssi\":" + WiFi.RSSI() + ",\"temp\":" + String(temperatureRead(), 1) +
-             ",\"heap\":" + ESP.getFreeHeap() + ",\"uptime\":\"" + ut + "\"" +
+             ",\"heap\":" + ESP.getFreeHeap() + ",\"uptime\":\"" + ut + "\"" + ",\"failed\":" + totalFailed +
              ",\"upurl\":\"" + jesc(updateUrl) + "\",\"upiv\":" + updateIntervalH + ",\"upstat\":\"" + jesc(updateStatus) + "\"" +
              ",\"clients\":[";
   for (int i = 0; i < numClients; i++) { Dev& c = clients[i]; IPAddress ip(c.ip);
@@ -249,7 +308,12 @@ static void handleStats() {
   web.send(200, "application/json", j);
 }
 static void handleBan() {
-  IPAddress ip; if (ip.fromString(web.arg("ip"))) { Dev* c = getClient((uint32_t)ip); if (c) { c->banned = !c->banned; saveBanned(); } }
+  IPAddress ip;
+  if (!ip.fromString(web.arg("ip"))) { web.send(400, "text/plain", "bad ip"); return; }
+  Dev* c = getClient((uint32_t)ip);
+  if (!c) { web.send(503, "text/plain", "client table full"); return; }
+  c->banned = !c->banned;
+  if (!saveBanned()) { web.send(500, "text/plain", "applied, but saving to flash failed"); return; }
   web.send(200, "text/plain", "ok");
 }
 
@@ -259,6 +323,8 @@ static void handleBan() {
 static void reopenBlocklist() {
   blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
   numHashes = blocklist ? blocklist.size() / HASH_BYTES : 0;
+  if (!blocklist && LittleFS.exists(BLOCKLIST_PATH))
+    Serial.println("[blocklist] reopen failed -> blocking disabled");
 }
 static void beginBlocklistSwap() {
   if (blocklist) blocklist.close();
@@ -270,37 +336,52 @@ static bool commitNewBlocklist() {                  // /blocklist.new -> live (v
   File f = LittleFS.open("/blocklist.new", "r");
   size_t sz = f ? f.size() : 0; if (f) f.close();
   bool ok = sz > 0 && (sz % HASH_BYTES) == 0;       // sorted hash blob -> 5-byte multiple
-  if (ok) LittleFS.rename("/blocklist.new", BLOCKLIST_PATH);
-  else    LittleFS.remove("/blocklist.new");
+  if (ok && !LittleFS.rename("/blocklist.new", BLOCKLIST_PATH)) {
+    Serial.println("[blocklist] rename failed -> new list discarded");
+    ok = false;
+  }
+  if (!ok) LittleFS.remove("/blocklist.new");
   reopenBlocklist();
-  return ok;
+  return ok && blocklist;
 }
 
 // ---------- OTA blocklist update (browser upload) ----------
 static bool upOk = false;
+static String upErr;
 static File upFile;
 static void handleUploadDone() {
-  web.send(upOk ? 200 : 500, "text/plain",
-           upOk ? "ok" : "rejected: empty or size not a multiple of 5 (not a blocklist.bin?)");
+  web.send(upOk ? 200 : 500, "text/plain", upOk ? "ok" : upErr);
 }
 static void handleUpload() {
   HTTPUpload& u = web.upload();
   switch (u.status) {
     case UPLOAD_FILE_START:
-      upOk = false; beginBlocklistSwap();
+      upOk = false; upErr = ""; beginBlocklistSwap();
       upFile = LittleFS.open("/blocklist.new", "w");
-      Serial.printf("[ota] receiving %s\n", u.filename.c_str());
+      if (!upFile) upErr = "cannot open /blocklist.new for writing";
+      Serial.printf("[ota] receiving %s%s\n", u.filename.c_str(), upErr.length() ? " -- " : "");
+      if (upErr.length()) Serial.println(upErr);
       break;
     case UPLOAD_FILE_WRITE:
-      if (upFile) upFile.write(u.buf, u.currentSize);
+      if (!upFile || upErr.length()) break;
+      if (upFile.write(u.buf, u.currentSize) != u.currentSize) {
+        upErr = "write failed (flash full?)";
+        Serial.printf("[ota] %s\n", upErr.c_str());
+        upFile.close();
+      }
       break;
     case UPLOAD_FILE_END:
       if (upFile) upFile.close();
-      upOk = commitNewBlocklist();
+      if (upErr.length()) { LittleFS.remove("/blocklist.new"); reopenBlocklist(); }
+      else {
+        upOk = commitNewBlocklist();
+        if (!upOk) upErr = "rejected: empty or size not a multiple of 5 (not a blocklist.bin?)";
+      }
       Serial.printf("[ota] %s -> %u domains\n", upOk ? "OK" : "REJECTED", numHashes);
       break;
     case UPLOAD_FILE_ABORTED:
       if (upFile) upFile.close();
+      upErr = "upload aborted by client";
       LittleFS.remove("/blocklist.new"); reopenBlocklist();
       Serial.println("[ota] aborted");
       break;
@@ -309,17 +390,26 @@ static void handleUpload() {
 
 // ---------- remote blocklist auto-update ----------
 static void loadUpdateCfg() {
-  File f = LittleFS.open("/update.cfg", "r"); if (!f) return;
+  if (!LittleFS.exists("/update.cfg")) return;
+  File f = LittleFS.open("/update.cfg", "r");
+  if (!f) { Serial.println("[fs] update.cfg open failed"); return; }
   updateUrl = f.readStringUntil('\n'); updateUrl.trim();
   String iv = f.readStringUntil('\n'); iv.trim(); if (iv.length()) updateIntervalH = iv.toInt();
   f.close(); if (updateIntervalH < 1) updateIntervalH = 1;
 }
-static void saveUpdateCfg() {
-  File f = LittleFS.open("/update.cfg", "w"); if (!f) return;
-  f.println(updateUrl); f.println(updateIntervalH); f.close();
+static bool saveUpdateCfg() {
+  if (!fsReady) return false;
+  File f = LittleFS.open("/update.cfg", "w");
+  if (!f) { Serial.println("[fs] update.cfg write open failed"); return false; }
+  bool ok = f.println(updateUrl) == updateUrl.length() + 2;
+  ok = f.println(updateIntervalH) > 0 && ok;
+  f.close();
+  if (!ok) Serial.println("[fs] update.cfg write failed (flash full?)");
+  return ok;
 }
 static bool fetchBlocklist(String url) {
   url.trim(); if (!url.length()) { updateStatus = "no url set"; return false; }
+  if (!fsReady) { updateStatus = "filesystem unavailable"; return false; }
   Serial.printf("[remote] GET %s\n", url.c_str());
   WiFiClientSecure cs; cs.setInsecure();            // blocklist isn't secret -> skip cert pinning
   WiFiClient cl;
@@ -334,12 +424,28 @@ static bool fetchBlocklist(String url) {
   if (!f) { http.end(); updateStatus = "fs open failed"; reopenBlocklist(); return false; }
   WiFiClient* stream = http.getStreamPtr();
   int len = http.getSize(); uint8_t b[1024]; size_t total = 0; uint32_t idle = millis();
+  const char* err = nullptr;
   while (http.connected() && (len < 0 || (int)total < len)) {
     size_t avail = stream->available();
-    if (avail) { int n = stream->readBytes(b, avail > sizeof(b) ? sizeof(b) : avail); if (n > 0) { f.write(b, n); total += n; idle = millis(); } }
-    else { if (millis() - idle > 15000) break; delay(2); }
+    if (avail) {
+      int n = stream->readBytes(b, avail > sizeof(b) ? sizeof(b) : avail);
+      if (n > 0) {
+        if (f.write(b, n) != (size_t)n) { err = "write failed (flash full?)"; break; }
+        total += n; idle = millis();
+      }
+    } else if (millis() - idle > 15000) { err = "stalled"; break; }
+    else delay(2);
   }
   f.close(); http.end();
+  // A truncated download can still be a 5-byte multiple, so trust
+  // Content-Length over the size check and keep the old list instead.
+  if (!err && len > 0 && (int)total != len) err = "truncated";
+  if (err) {
+    LittleFS.remove("/blocklist.new"); reopenBlocklist();
+    updateStatus = String(err) + " (" + total + "B)";
+    Serial.printf("[remote] %s\n", updateStatus.c_str());
+    return false;
+  }
   bool ok = commitNewBlocklist();
   updateStatus = ok ? ("ok: " + String(numHashes) + " domains") : ("bad data (" + String(total) + "B)");
   Serial.printf("[remote] %s\n", updateStatus.c_str());
@@ -347,53 +453,80 @@ static bool fetchBlocklist(String url) {
 }
 
 // ---------- firmware OTA (browser upload of firmware.bin -> reboot) ----------
+static String fwErr;
 static void handleFwUpdateDone() {
-  bool ok = !Update.hasError();
-  web.send(ok ? 200 : 500, "text/plain", ok ? "ok, rebooting" : "firmware update failed");
+  bool ok = fwErr.length() == 0 && !Update.hasError();
+  web.send(ok ? 200 : 500, "text/plain", ok ? "ok, rebooting" : ("firmware update failed: " + fwErr));
   if (ok) { delay(300); ESP.restart(); }
 }
 static void handleFwUpload() {
   HTTPUpload& u = web.upload();
   if (u.status == UPLOAD_FILE_START) {
+    fwErr = "";
     Serial.printf("[fw-ota] %s\n", u.filename.c_str());
-    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { fwErr = Update.errorString(); Update.printError(Serial); }
   } else if (u.status == UPLOAD_FILE_WRITE) {
-    if (Update.write(u.buf, u.currentSize) != u.currentSize) Update.printError(Serial);
+    // Once a write fails the image is corrupt: stop feeding it more data.
+    if (fwErr.length()) return;
+    if (Update.write(u.buf, u.currentSize) != u.currentSize) {
+      fwErr = Update.errorString(); Update.printError(Serial); Update.abort();
+    }
   } else if (u.status == UPLOAD_FILE_END) {
+    if (fwErr.length()) return;
     if (Update.end(true)) Serial.printf("[fw-ota] %u bytes OK\n", u.totalSize);
-    else Update.printError(Serial);
+    else { fwErr = Update.errorString(); Update.printError(Serial); }
   } else if (u.status == UPLOAD_FILE_ABORTED) {
-    Update.abort(); Serial.println("[fw-ota] aborted");
+    Update.abort(); fwErr = "aborted by client"; Serial.println("[fw-ota] aborted");
   }
 }
 
 void setup() {
   Serial.begin(115200); delay(300);
   Serial.println("\n[c3-adblock] booting");
-  if (!LittleFS.begin(true)) Serial.println("LittleFS FAILED");
-  blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
-  if (blocklist) { numHashes = blocklist.size() / HASH_BYTES; Serial.printf("blocklist: %u domains\n", numHashes); }
-  loadCustom(); loadBanned(); loadUpdateCfg();
-  Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
+  fsReady = LittleFS.begin(true);
+  if (!fsReady) {
+    // No flash: no blocklist, no persistence. Still boot as a plain forwarder.
+    Serial.println("[fs] LittleFS mount FAILED -> no blocklist, settings not persisted");
+  } else {
+    reopenBlocklist();
+    if (numHashes) Serial.printf("blocklist: %u domains\n", numHashes);
+    else Serial.println("[blocklist] missing or empty -> forwarding everything");
+    loadCustom(); loadBanned(); loadUpdateCfg();
+    Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
+  }
 
   WiFi.mode(WIFI_STA); WiFi.setSleep(false); WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.print("WiFi"); while (WiFi.status() != WL_CONNECTED) { delay(300); Serial.print("."); }
+  Serial.print("WiFi");
+  for (uint32_t t0 = millis(); WiFi.status() != WL_CONNECTED; ) {
+    delay(300); Serial.print(".");
+    if (millis() - t0 < 30000) continue;
+    Serial.printf("\n[wifi] no connection after 30s (status %d) -> rebooting\n", WiFi.status());
+    delay(200); ESP.restart();
+  }
   Serial.printf("\nWiFi up: %s\n", WiFi.localIP().toString().c_str());
   if (MDNS.begin("c3adblock")) { MDNS.addService("http", "tcp", 80); Serial.println("dashboard: http://c3adblock.local"); }
+  else Serial.println("[mdns] start failed -> reach the dashboard by IP");
 
   dnsServer.begin(DNS_PORT); upstreamCli.begin(0);
   web.on("/", []() { web.send_P(200, "text/html", PAGE); });
   web.on("/stats.json", handleStats);
   web.on("/ban", handleBan);
-  web.on("/addblock", []() { addCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
-  web.on("/unblock", []() { removeCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
+  web.on("/addblock", []() { const char* e = addCustom(web.arg("d")); web.send(e ? 400 : 200, "text/plain", e ? e : "ok"); });
+  web.on("/unblock", []() { const char* e = removeCustom(web.arg("d")); web.send(e ? 400 : 200, "text/plain", e ? e : "ok"); });
   web.on("/upload", HTTP_POST, handleUploadDone, handleUpload);      // blocklist OTA
   web.on("/update", HTTP_POST, handleFwUpdateDone, handleFwUpload);  // firmware OTA
-  web.on("/fetchnow", []() { fetchBlocklist(updateUrl); web.send(200, "text/plain", updateStatus); });
+  web.on("/fetchnow", []() { bool ok = fetchBlocklist(updateUrl); web.send(ok ? 200 : 500, "text/plain", updateStatus); });
   web.on("/setupdate", []() {
-    if (web.hasArg("u")) updateUrl = web.arg("u");
+    if (web.hasArg("u")) {
+      String u = web.arg("u"); u.trim();
+      if (u.length() && !u.startsWith("http://") && !u.startsWith("https://")) {
+        web.send(400, "text/plain", "url must start with http:// or https://"); return;
+      }
+      updateUrl = u;
+    }
     if (web.hasArg("h")) { updateIntervalH = web.arg("h").toInt(); if (updateIntervalH < 1) updateIntervalH = 1; }
-    saveUpdateCfg(); web.send(200, "text/plain", "ok");
+    if (!saveUpdateCfg()) { web.send(500, "text/plain", "applied, but saving to flash failed"); return; }
+    web.send(200, "text/plain", "ok");
   });
   web.begin();
   ArduinoOTA.setHostname("c3adblock");   // pio run -t upload --upload-port c3adblock.local
@@ -405,6 +538,11 @@ void loop() {
   ArduinoOTA.handle();
   web.handleClient();
   handleDns();
+  if (WiFi.status() != WL_CONNECTED) {      // silent WiFi drop = silent outage
+    static uint32_t lastDrop = 0, lastRetry = 0;
+    logThrottled(lastDrop, "[wifi] disconnected -> reconnecting");
+    if (millis() - lastRetry > 10000) { lastRetry = millis(); WiFi.reconnect(); }
+  }
   if (updateUrl.length()) {               // periodic remote blocklist auto-update
     uint32_t now = millis();
     if (lastCheckMs == 0) lastCheckMs = now;   // skip an immediate fetch on boot
