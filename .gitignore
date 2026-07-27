@@ -8,5 +8,10 @@ data/blocklist.bin
 # WiFi credentials (copy src/secrets.example.h -> src/secrets.h)
 src/secrets.h
 
+# Native test binaries
+test/build/
+__pycache__/
+.pytest_cache/
+
 # Backups / scratch
 *.bak

@@ -5,6 +5,7 @@
 #include <Arduino.h>
 #include <LittleFS.h>
 #include <WebServer.h>
+#include "dns_core.h"   // pure helpers, unit-tested natively (test/native)
 
 // ---------- LittleFS text files ----------
 // Every persisted control file (custom domains, banned IPs, update config) is a
@@ -36,24 +37,13 @@ static bool fsWriteLines(const char* path, int count, Fn lineAt) {
 // ---------- domains ----------
 // Same normalisation as tools/build_blocklist.py norm(): lowercase, no leading
 // wildcard/dot, no trailing dot, no "www." prefix.
-static String normalizeDomain(String d) {
-  d.trim();
-  d.toLowerCase();
-  while (d.startsWith("*") || d.startsWith(".")) d = d.substring(1);
-  while (d.endsWith(".")) d = d.substring(0, d.length() - 1);
-  if (d.startsWith("www.")) d = d.substring(4);
-  return d;
+static String normalizeDomain(const String& d) {
+  char out[256];
+  return String(dnscore::normalizeDomain(d.c_str(), out, sizeof(out)));
 }
 // A domain label set: letters, digits, '-', '.'. Anything else (quotes, angle
 // brackets, control chars) is rejected so stored values can never carry markup.
-static bool isValidDomain(const String& d) {
-  if (d.length() < 3 || d.length() > 253) return false;
-  for (char ch : d) {
-    bool ok = (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '.';
-    if (!ok) return false;
-  }
-  return d.indexOf('.') > 0 && !d.startsWith(".") && !d.endsWith(".") && d.indexOf("..") < 0;
-}
+static bool isValidDomain(const String& d) { return dnscore::validDomain(d.c_str(), d.length()); }
 
 // ---------- arrays ----------
 template <typename T>
@@ -79,15 +69,7 @@ static String uptimeToString(uint32_t seconds) {
   snprintf(s, sizeof(s), "%lud %luh %lum", seconds / 86400, (seconds % 86400) / 3600, (seconds % 3600) / 60);
   return String(s);
 }
-static String jsonEscape(const String& s) {
-  String o;
-  for (char ch : s) {
-    if (ch == '"' || ch == '\\') { o += '\\'; o += ch; }
-    else if ((uint8_t)ch < 0x20) { char u[7]; snprintf(u, sizeof(u), "\\u%04x", ch); o += u; }
-    else o += ch;
-  }
-  return o;
-}
+static String jsonEscape(const String& s) { String o; dnscore::appendJsonEscaped(o, s.c_str()); return o; }
 static String jsonString(const String& s) { return "\"" + jsonEscape(s) + "\""; }
 
 // ---------- web replies ----------

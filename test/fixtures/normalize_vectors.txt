@@ -1,0 +1,21 @@
+# Shared domain-normalisation vectors: the firmware (dnscore::normalizeDomain,
+# used for dashboard input) and the blocklist builder (norm()) must agree, or a
+# domain typed into the dashboard hashes differently from the same domain in the
+# generated blob.
+# format: <raw input> <expected output>   (both single tokens; leading/trailing
+# whitespace handling is tested separately in each language)
+example.com example.com
+Example.COM example.com
+EXAMPLE.com example.com
+example.com. example.com
+example.com... example.com
+.example.com example.com
+*.example.com example.com
+*example.com example.com
+www.example.com example.com
+WWW.Example.com example.com
+www.www.example.com www.example.com
+wwww.example.com wwww.example.com
+www2.example.com www2.example.com
+sub.www.example.com sub.www.example.com
+ads.sub.example.co.uk ads.sub.example.co.uk
