@@ -44,8 +44,15 @@ static String normalizeDomain(String d) {
   if (d.startsWith("www.")) d = d.substring(4);
   return d;
 }
+// A domain label set: letters, digits, '-', '.'. Anything else (quotes, angle
+// brackets, control chars) is rejected so stored values can never carry markup.
 static bool isValidDomain(const String& d) {
-  return d.length() && d.indexOf('.') > 0 && d.indexOf(' ') < 0;
+  if (d.length() < 3 || d.length() > 253) return false;
+  for (char ch : d) {
+    bool ok = (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '.';
+    if (!ok) return false;
+  }
+  return d.indexOf('.') > 0 && !d.startsWith(".") && !d.endsWith(".") && d.indexOf("..") < 0;
 }
 
 // ---------- arrays ----------
@@ -74,7 +81,11 @@ static String uptimeToString(uint32_t seconds) {
 }
 static String jsonEscape(const String& s) {
   String o;
-  for (char ch : s) { if (ch == '"' || ch == '\\') o += '\\'; o += ch; }
+  for (char ch : s) {
+    if (ch == '"' || ch == '\\') { o += '\\'; o += ch; }
+    else if ((uint8_t)ch < 0x20) { char u[7]; snprintf(u, sizeof(u), "\\u%04x", ch); o += u; }
+    else o += ch;
+  }
   return o;
 }
 static String jsonString(const String& s) { return "\"" + jsonEscape(s) + "\""; }
