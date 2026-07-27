@@ -321,6 +321,72 @@ static void test_query_to_answer() {
   CHECK(!dnscore::isBlockedDomain(domain, [&](uint64_t h) { return flash.contains(h); }));
 }
 
+// ---------- dashboard input validation / escaping ----------
+
+static bool valid(const char* d) { return dnscore::validDomain(d, strlen(d)); }
+static bool validStr(const std::string& d) { return dnscore::validDomain(d.c_str(), d.size()); }
+
+// Kept in a member so the escaped result outlives the CHECK_EQ_STR expression.
+struct Escaper {
+  std::string out;
+  const char* operator()(const std::string& s) {
+    out.clear();
+    dnscore::appendJsonEscaped(out, s.c_str());
+    return out.c_str();
+  }
+};
+
+static void test_valid_domain() {
+  TEST_CASE("ordinary domains are accepted");
+  CHECK(valid("a.co"));
+  CHECK(valid("ads.example.com"));
+  CHECK(valid("my-host.sub.example.co.uk"));
+  CHECK(valid("xn--80ak6aa92e.com"));
+  CHECK(valid("1.2.3.4"));
+
+  TEST_CASE("markup and control characters are rejected, so nothing stored can carry them");
+  CHECK(!valid("<script>.com"));
+  CHECK(!valid("ex\"ample.com"));
+  CHECK(!valid("ex ample.com"));
+  CHECK(!valid("ex\nample.com"));
+  CHECK(!valid("ex/ample.com"));
+  CHECK(!valid("Example.com"));            // callers lowercase first
+
+  TEST_CASE("malformed dot placement is rejected");
+  CHECK(!valid(".example.com"));
+  CHECK(!valid("example.com."));
+  CHECK(!valid("example..com"));
+  CHECK(!valid("nodot"));
+  CHECK(!valid("..."));
+
+  TEST_CASE("length bounds");
+  CHECK(!valid(""));
+  CHECK(!valid("a."));
+  CHECK(validStr(std::string(120, 'a') + "." + std::string(120, 'b')));   // 241 chars
+  CHECK(!validStr(std::string(200, 'a') + "." + std::string(200, 'b')));  // 401 chars
+}
+
+static void test_json_escaping() {
+  Escaper escaped;
+
+  TEST_CASE("plain text passes through");
+  CHECK_EQ_STR(escaped("ads.example.com"), "ads.example.com");
+
+  TEST_CASE("quotes and backslashes are escaped");
+  CHECK_EQ_STR(escaped("a\"b"), "a\\\"b");
+  CHECK_EQ_STR(escaped("a\\b"), "a\\\\b");
+
+  TEST_CASE("control characters become \\u00xx, keeping stats.json parseable");
+  CHECK_EQ_STR(escaped("a\nb"), "a\\u000ab");
+  CHECK_EQ_STR(escaped("a\tb"), "a\\u0009b");
+  CHECK_EQ_STR(escaped(std::string("a\x1f" "b")), "a\\u001fb");
+
+  TEST_CASE("appends rather than overwrites");
+  std::string out = "prefix:";
+  dnscore::appendJsonEscaped(out, "x\"y");
+  CHECK_EQ_STR(out.c_str(), "prefix:x\\\"y");
+}
+
 int main() {
   RUN_SUITE(test_fnv40);
   RUN_SUITE(test_hash_codec);
@@ -329,5 +395,7 @@ int main() {
   RUN_SUITE(test_parse_query);
   RUN_SUITE(test_build_blocked_response);
   RUN_SUITE(test_query_to_answer);
+  RUN_SUITE(test_valid_domain);
+  RUN_SUITE(test_json_escaping);
   return TEST_MAIN_RESULT();
 }

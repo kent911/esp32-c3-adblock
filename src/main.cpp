@@ -64,14 +64,7 @@ static bool isBlocked(const char* domain) {
 // ---------- persistence ----------
 // A domain label set: letters, digits, '-', '.'. Anything else (quotes, angle
 // brackets, control chars) is rejected so stored values can never carry markup.
-static bool validDomain(const String& d) {
-  if (d.length() < 3 || d.length() > 253) return false;
-  for (char ch : d) {
-    bool ok = (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '.';
-    if (!ok) return false;
-  }
-  return d.indexOf('.') > 0 && !d.startsWith(".") && !d.endsWith(".") && d.indexOf("..") < 0;
-}
+static bool validDomain(const String& d) { return dnscore::validDomain(d.c_str(), d.length()); }
 static void loadCustom() {
   numCustom = 0; File f = LittleFS.open("/custom.txt", "r"); if (!f) return;
   while (f.available() && numCustom < MAX_CUSTOM) {
@@ -151,15 +144,7 @@ static void handleDns() {
 
 // ---------- web ----------
 static String macStr(const uint8_t* m) { char s[18]; snprintf(s, sizeof(s), "%02x:%02x:%02x:%02x:%02x:%02x", m[0],m[1],m[2],m[3],m[4],m[5]); return String(s); }
-static String jesc(const String& s) {
-  String o;
-  for (char ch : s) {
-    if (ch == '"' || ch == '\\') { o += '\\'; o += ch; }
-    else if ((uint8_t)ch < 0x20) { char u[7]; snprintf(u, sizeof(u), "\\u%04x", ch); o += u; }
-    else o += ch;
-  }
-  return o;
-}
+static String jesc(const String& s) { String o; dnscore::appendJsonEscaped(o, s.c_str()); return o; }
 
 // ---------- access control ----------
 // Everything below is reachable from any host on the LAN, including firmware

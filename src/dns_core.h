@@ -90,4 +90,36 @@ inline int buildBlockedResponse(uint8_t* buf, int qend, uint16_t qtype) {
   return qend + (int)sizeof(ans);
 }
 
+// Accepts only what a stored/serialised domain may contain: lowercase letters,
+// digits, '-' and '.', with no leading/trailing/doubled dot. Keeps markup and
+// control characters out of custom.txt and of the dashboard JSON.
+inline bool validDomain(const char* d, size_t n) {
+  if (n < 3 || n > 253) return false;
+  if (d[0] == '.' || d[n - 1] == '.') return false;
+  bool hasDot = false;
+  for (size_t i = 0; i < n; i++) {
+    char ch = d[i];
+    bool ok = (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '.';
+    if (!ok) return false;
+    if (ch == '.') { if (i && d[i - 1] == '.') return false; hasDot = true; }
+  }
+  return hasDot;
+}
+
+// Appends `s` to `out` (Arduino String or std::string) escaped for a JSON
+// string literal.
+template <typename Str>
+inline void appendJsonEscaped(Str& out, const char* s) {
+  for (const char* p = s; *p; p++) {
+    char ch = *p;
+    if (ch == '"' || ch == '\\') { out += '\\'; out += ch; }
+    else if ((uint8_t)ch < 0x20) {
+      const char* hex = "0123456789abcdef";
+      out += '\\'; out += 'u'; out += '0'; out += '0';
+      out += hex[((uint8_t)ch >> 4) & 0xF]; out += hex[(uint8_t)ch & 0xF];
+    }
+    else out += ch;
+  }
+}
+
 }  // namespace dnscore
