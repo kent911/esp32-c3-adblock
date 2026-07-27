@@ -104,6 +104,20 @@ dig @<c3-ip> doubleclick.net   # -> 0.0.0.0  (blocked)
 dig @<c3-ip> github.com        # -> real IP  (forwarded)
 ```
 
+## Tests
+
+The query path (hashing, blocklist binary search, DNS parse/answer) lives in
+[`src/dns_core.h`](src/dns_core.h) with no Arduino dependencies, so it runs on the host:
+
+```bash
+make -C test test                    # native C++ tests for the firmware core
+pip install -r test/requirements.txt
+python -m pytest test/python -q      # tests for tools/build_blocklist.py
+```
+
+Both suites hash the vectors in `test/fixtures/hash_vectors.txt`, which is what keeps the
+firmware and the blocklist builder from silently drifting apart.
+
 ## Gotchas (learned the hard way)
 
 - **ModemManager** (default on Fedora/Ubuntu) grabs `/dev/ttyACM0` and toggles
