@@ -22,7 +22,7 @@ jobs:
 
       - name: Generate Fresh Blocklist
         run: |
-          python tools/build_blocklist.py data/blocklist.bin
+          python tools/build_blocklist.py data/blocklist.bin --allow-partial
 
       - name: Commit and Push changes
         run: |
